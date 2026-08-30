@@ -1343,7 +1343,7 @@ Note the method these came from: checking the design against the *product* rathe
 against itself. A review that only checks internal consistency cannot find a concept that is
 simply missing, because a missing concept contradicts nothing.
 
-### Excluded by the brief
+### Excluded by scope
 
 UI, auth, accounts, KYC. Real chain integration or real money movement. Pricing,
 correlation, and risk logic.
