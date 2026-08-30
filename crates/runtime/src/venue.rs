@@ -95,6 +95,9 @@ pub struct RoundOutcome {
     pub coverage_violations: u64,
     /// Events evicted from the ring unread.
     pub events_dropped: u64,
+    /// Events the engine emitted. Counted so a test can assert the engine *did* emit —
+    /// an event path that carries nothing proves nothing about the publisher.
+    pub events_emitted: u64,
 }
 
 /// A running venue: one engine thread, one publisher thread, one bounded command channel.
@@ -227,6 +230,7 @@ fn run_engine<C: Clock>(
     let mut sequence: u64 = 0;
     let mut coverage_checks: u64 = 0;
     let mut coverage_violations: u64 = 0;
+    let mut events_emitted: u64 = 0;
 
     loop {
         match inbox.try_recv() {
@@ -247,6 +251,7 @@ fn run_engine<C: Clock>(
                 {
                     for event in events.drain() {
                         ring.push(event);
+                        events_emitted = events_emitted.saturating_add(1);
                     }
                 }
 
@@ -262,7 +267,14 @@ fn run_engine<C: Clock>(
     }
 
     let events_dropped = ring.lock().map_or(0, |ring| ring.dropped());
-    RoundOutcome { engine, log, coverage_checks, coverage_violations, events_dropped }
+    RoundOutcome {
+        engine,
+        log,
+        coverage_checks,
+        coverage_violations,
+        events_dropped,
+        events_emitted,
+    }
 }
 
 /// Drains the ring and performs all I/O. Owns no engine state and writes none.

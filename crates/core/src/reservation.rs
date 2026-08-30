@@ -144,6 +144,15 @@ impl Reservation {
         }
     }
 
+    /// Reduce a claim to the part that actually fills.
+    ///
+    /// Only the commit phase calls this, and only downwards: the requester reserves at the
+    /// limit and commits at the fill (§7.2).
+    pub(crate) const fn set_amount(&mut self, amount: Amount) {
+        debug_assert!(amount.0 <= self.amount.0, "a claim may only ever shrink");
+        self.amount = amount;
+    }
+
     pub(crate) const fn links(&self) -> ClaimLinks {
         self.links
     }

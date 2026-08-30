@@ -72,6 +72,44 @@ impl Amount {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Price(pub u32);
 
+/// Which side of a binary contract the **requester** is buying (SPEC §2.1).
+///
+/// Every leg carries one. The maker takes the opposite side of that leg.
+///
+/// Without it a requester could only ever be long `Yes` on every leg, which reduces
+/// multi-leg to a parlay and cannot express a spread — and the spread is the motivating
+/// multi-leg product. It is also what makes one contribution formula cover both sides:
+/// buying `No` at `q` is economically identical to selling `Yes` at `UNIT − q`, and the
+/// price is always the price of the side being bought, so selection needs no side-specific
+/// branch and lowest-is-best holds on both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    /// The requester is buying `Yes`; the maker takes `No`.
+    ///
+    /// `Default` only so that a fixed-size leg array can be initialised before its real legs
+    /// are written; no admission path ever reads an unwritten slot, because `n_legs` bounds
+    /// every walk.
+    #[default]
+    Yes,
+    /// The requester is buying `No`; the maker takes `Yes`.
+    No,
+}
+
+impl Side {
+    /// The side the maker takes.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Yes => Self::No,
+            Self::No => Self::Yes,
+        }
+    }
+}
+
+/// Which leg of a request. Dense, `0 .. request.n_legs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LegId(pub u8);
+
 /// A number of contracts.
 ///
 /// Contribution is `size × price` with the product taken in `u128` and checked on
@@ -109,6 +147,41 @@ pub struct Size(pub u64);
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ts(pub u64);
+
+impl Size {
+    /// `size × price`, in minor units, or `None` on overflow (SPEC §2.5).
+    ///
+    /// The product is taken in `u128` and checked on narrowing, which is the only place the
+    /// two dimensions meet. There is no division anywhere in the money path, so there is no
+    /// rounding rule, no dust, and no "who eats the remainder" question — the representation
+    /// makes it unaskable rather than answering it (§2.1).
+    #[must_use]
+    pub fn checked_mul(self, price: Price) -> Option<Amount> {
+        let product = u128::from(self.0).checked_mul(u128::from(price.0))?;
+        u64::try_from(product).ok().map(Amount)
+    }
+
+    /// The requester's contribution for this leg: `size × price`.
+    #[must_use]
+    pub fn requester_contribution(self, price: Price) -> Option<Amount> {
+        self.checked_mul(price)
+    }
+
+    /// The maker's contribution for this leg: `size × (UNIT − price)`.
+    ///
+    /// The two contributions sum to `size × UNIT` **exactly**, by construction.
+    #[must_use]
+    pub fn maker_contribution(self, price: Price) -> Option<Amount> {
+        let complement = Price(UNIT.0.checked_sub(price.0)?);
+        self.checked_mul(complement)
+    }
+
+    /// The escrowed notional for this leg: `size × UNIT`.
+    #[must_use]
+    pub fn notional(self) -> Option<Amount> {
+        self.checked_mul(UNIT)
+    }
+}
 
 impl Ts {
     /// The epoch itself.

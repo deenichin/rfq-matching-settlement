@@ -11,11 +11,36 @@
 
 use proptest::prelude::*;
 use rfq_core::account::AccountIdx;
-use rfq_core::config::Config;
+use rfq_core::config::{Config, MAX_LEGS};
+use rfq_core::contract::ContractIdx;
 use rfq_core::ledger::{Ledger, LedgerError, SlabKind};
-use rfq_core::request::ReqIdx;
+use rfq_core::quote::{Quote, QuoteIdx};
+use rfq_core::request::{Leg, ReqIdx, Request};
 use rfq_core::reservation::{ResIdx, ResOwner};
-use rfq_core::types::{Amount, Ts};
+use rfq_core::types::{Amount, LegId, Price, Side, Size, Ts};
+
+/// A one-leg request, used only as an owner and a committed list.
+fn request_record(requester: AccountIdx) -> Request {
+    let mut legs = [Leg::default(); MAX_LEGS];
+    legs[0] = Leg::new(ContractIdx(0), Side::Yes, Size(1), Price(1_000));
+    Request::new(requester, Ts(u64::MAX), legs, 1)
+}
+
+/// Open a quote owner holding no claim, so the test can give it one of its own.
+fn open_quote_owner(ledger: &mut Ledger, request: ReqIdx) -> Option<QuoteIdx> {
+    let record = Quote::new(AccountIdx(0), request, LegId(0), Price(1), Size(1), Ts(u64::MAX), 0);
+    let (quote, claim) = ledger.open_quote_reserving(record, Amount::ZERO).ok()?;
+    ledger.release(claim).ok()?;
+    Some(quote)
+}
+
+/// A request holding no claim of its own.
+fn open_bare_request(ledger: &mut Ledger) -> ReqIdx {
+    let (request, claim) =
+        ledger.open_request_reserving(request_record(AccountIdx(0)), Amount::ZERO).unwrap();
+    ledger.release(claim).unwrap();
+    request
+}
 
 const ACCOUNTS: u32 = 3;
 const CAPACITY: u32 = 12;
@@ -28,8 +53,9 @@ fn fresh_ledger() -> Ledger {
     let config = Config {
         max_accounts: ACCOUNTS,
         max_reservations: CAPACITY,
-        max_requests: 4,
+        max_requests: 8,
         max_quotes: CAPACITY,
+        max_contracts: 2,
         ..Config::default()
     };
     let mut ledger = Ledger::new(&config);
@@ -76,14 +102,14 @@ proptest! {
     fn invariants_1_and_2_hold_over_randomised_sequences(ops in proptest::collection::vec(op(), 0..200)) {
         let mut ledger = fresh_ledger();
         let capacity = ledger.reservation_capacity();
-        let requests: Vec<ReqIdx> = (0..4).map(|_| ledger.open_request().unwrap()).collect();
+        let requests: Vec<ReqIdx> = (0..4).map(|_| open_bare_request(&mut ledger)).collect();
         let mut model = Model { reserved: Vec::new(), committed: Vec::new() };
 
         for op in ops {
             match op {
                 Op::Reserve { account, expires_at } => {
                     let account = AccountIdx(account);
-                    let Ok(quote) = ledger.open_quote() else { continue };
+                    let Some(quote) = open_quote_owner(&mut ledger, requests[0]) else { continue };
                     match ledger.reserve(account, Amount(1), Ts(expires_at), ResOwner::Quote(quote)) {
                         Ok(claim) => model.reserved.push((claim, account.0, expires_at)),
                         // The only admissible refusals, and each must be true of the model.
@@ -130,7 +156,7 @@ proptest! {
 
             // §15.1 in the chain-sum form, plus chain structure, plus §15.3's
             // resolve-and-point-back. Asserted after every single step, not only at the end.
-            prop_assert_eq!(ledger.check_invariants(), Ok(()));
+            prop_assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
             // Gate (d), the allocation proxy: no container grew (CLAUDE 25).
             prop_assert_eq!(ledger.reservation_capacity(), capacity);
@@ -166,13 +192,15 @@ proptest! {
         interleaved_nows in proptest::collection::vec(0u64..30, 0..8),
     ) {
         let mut ledger = fresh_ledger();
-        let request = ledger.open_request().unwrap();
+        let request = open_bare_request(&mut ledger);
         let mut committed: Vec<(ResIdx, u32, u64)> = Vec::new();
         let mut siblings: Vec<(ResIdx, u32, u64)> = Vec::new();
 
         for (account, expires_at) in pairs {
             let account = AccountIdx(account);
-            let (Ok(quote_a), Ok(quote_b)) = (ledger.open_quote(), ledger.open_quote()) else {
+            let (Some(quote_a), Some(quote_b)) =
+                (open_quote_owner(&mut ledger, request), open_quote_owner(&mut ledger, request))
+            else {
                 continue;
             };
             let Ok(claim) = ledger.reserve(account, Amount(1), Ts(expires_at), ResOwner::Quote(quote_a))
@@ -205,7 +233,7 @@ proptest! {
                 ledger.release_expired(account, Ts(now)).unwrap();
                 prop_assert_eq!(ledger.check_normalised(account, Ts(now)), Ok(()));
             }
-            prop_assert_eq!(ledger.check_invariants(), Ok(()));
+            prop_assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
             // Every committed claim still resolves, is still committed, and still has no
             // expiry — at every `now`, not merely at the end.

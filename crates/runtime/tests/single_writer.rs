@@ -35,9 +35,10 @@ use std::sync::{Arc, Barrier};
 
 use rfq_core::account::AccountIdx;
 use rfq_core::clock::TickClock;
-use rfq_core::command::Command;
-use rfq_core::config::Config;
-use rfq_core::types::{Amount, Dur, Ts};
+use rfq_core::command::{Command, LegSpec};
+use rfq_core::config::{Config, MAX_LEGS};
+use rfq_core::contract::ContractIdx;
+use rfq_core::types::{Amount, Dur, Price, Side, Size, Ts};
 use rfq_runtime::clock::MonotonicClock;
 use rfq_runtime::venue::{
     LogEntry, NullSink, RoundOutcome, RuntimeCapacities, Venue, replay,
@@ -45,14 +46,18 @@ use rfq_runtime::venue::{
 
 const CLIENTS: u32 = 4;
 const COMMANDS_PER_CLIENT: u32 = 24;
-const FUNDING: u64 = 1_000;
+const FUNDING: u64 = 1_000_000;
+/// Every client references this one contract; registering it is each round's first command.
+const CONTRACT: ContractIdx = ContractIdx(0);
+const EVENT_DATE: Ts = Ts(100_000_000);
 
 fn config() -> Config {
     Config {
         max_accounts: CLIENTS,
-        max_reservations: 64,
-        max_requests: 32,
-        max_quotes: 64,
+        max_reservations: 128,
+        max_requests: 128,
+        max_quotes: 128,
+        max_contracts: 4,
         ..Config::default()
     }
 }
@@ -61,12 +66,15 @@ fn config() -> Config {
 /// run to completion before the others get going — which is what makes the interleaving
 /// assertion below something the runtime has to earn.
 fn capacities() -> RuntimeCapacities {
-    RuntimeCapacities { command_channel: 2, event_ring: 64, event_buffer: 16, command_log: 256 }
+    RuntimeCapacities { command_channel: 2, event_ring: 256, event_buffer: 64, command_log: 256 }
 }
 
-/// The commands one client submits. Deliberately mixed: a mirror update, then quotes and
-/// requests with short TTLs so that later commands in the same round normalise earlier ones
-/// away, and one guaranteed rejection in every eighth slot.
+/// The commands one client submits: a mirror update, then requests with varying deadlines,
+/// and one guaranteed rejection in every eighth slot.
+///
+/// The deadlines are a few ticks out, against a clock moving one tick per read, so a
+/// request opened early in the round is expired — and its claim reclaimed by normalisation —
+/// by the time a later command touches the same account.
 ///
 /// The rejections are not decoration. A rejected command still normalises the account it
 /// touched (SPEC §4.3), so "every submitted command appears exactly once in the log" has to
@@ -77,18 +85,20 @@ fn client_commands(client: u32) -> Vec<Command> {
     let mut commands = Vec::with_capacity(COMMANDS_PER_CLIENT as usize);
     commands.push(Command::CreditAccount { account, free: Amount(FUNDING) });
     for step in 1..COMMANDS_PER_CLIENT {
-        let amount = Amount(u64::from(step % 7) + 1);
-        // TTLs of a few ticks, against a clock moving one tick per read: claims made early
-        // in the round are dead by the time later commands touch the same account.
-        let ttl = Dur(u64::from(step % 5) + 1);
-        commands.push(if step % 8 == 7 {
+        let mut legs = [LegSpec::default(); MAX_LEGS];
+        // Deadlines land in a band that the tick clock crosses partway through the round:
+        // requests submitted early are admitted and then expire while the round is still
+        // running, and requests submitted late are refused outright. Both halves are wanted
+        // — the first exercises normalisation, the second keeps rejections in the log.
+        let deadline = Ts(1_000 + 30 + u64::from(step % 7) * 3);
+        let (size, limit) = if step % 8 == 7 {
             // Ten times the account's whole balance: refused with InsufficientFree, always.
-            Command::OpenQuote { maker: account, amount: Amount(FUNDING * 10), ttl }
-        } else if step % 3 == 0 {
-            Command::OpenRequest { requester: account, amount, ttl }
+            (Size(FUNDING * 10), Price(1_000))
         } else {
-            Command::OpenQuote { maker: account, amount, ttl }
-        });
+            (Size(u64::from(step % 7) + 1), Price(1_000))
+        };
+        legs[0] = LegSpec { contract: CONTRACT, side: Side::Yes, size, limit };
+        commands.push(Command::SubmitRequest { requester: account, deadline, legs, n_legs: 1 });
     }
     commands
 }
@@ -96,6 +106,13 @@ fn client_commands(client: u32) -> Vec<Command> {
 /// Run one round with `CLIENTS` client threads submitting concurrently.
 fn concurrent_round<C: rfq_core::clock::Clock + Send + 'static>(clock: C) -> RoundOutcome {
     let venue = Venue::start(config(), clock, NullSink, capacities()).unwrap();
+
+    // The contract every client's legs reference. Submitted before the clients start, so
+    // the round's interleaving is over the requests and not over this.
+    venue
+        .commands()
+        .send(Command::RegisterContract { contract: CONTRACT, event_date: EVENT_DATE })
+        .unwrap();
 
     // A barrier so the clients are released together. Without it the first thread spawned
     // can finish before the last is scheduled, and the race the test is about never happens.
@@ -127,9 +144,8 @@ fn concurrent_round<C: rfq_core::clock::Clock + Send + 'static>(clock: C) -> Rou
 fn client_of(entry: &LogEntry) -> Option<u32> {
     match entry.command {
         Command::CreditAccount { account, .. } => Some(account.0),
-        Command::OpenQuote { maker, .. } => Some(maker.0),
-        Command::OpenRequest { requester, .. } => Some(requester.0),
-        Command::CloseQuote { .. } | Command::CommitQuote { .. } => None,
+        Command::SubmitRequest { requester, .. } => Some(requester.0),
+        _ => None,
     }
 }
 
@@ -150,11 +166,18 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
     // 100 iterations. Flakiness here is a finding, not something to retry around.
     for iteration in 0..100 {
         let outcome = concurrent_round(TickClock::new(start, Dur(1)));
-        let RoundOutcome { engine, log, coverage_checks, coverage_violations, events_dropped } =
-            outcome;
+        let RoundOutcome {
+            engine,
+            log,
+            coverage_checks,
+            coverage_violations,
+            events_dropped,
+            events_emitted,
+        } = outcome;
 
         // ── (a) every submitted command appears exactly once, in channel order ──
-        let expected = (CLIENTS * COMMANDS_PER_CLIENT) as usize;
+        // One RegisterContract, then every client's commands.
+        let expected = (CLIENTS * COMMANDS_PER_CLIENT) as usize + 1;
         assert_eq!(log.len(), expected, "iteration {iteration}: a command was lost or doubled");
         for (position, entry) in log.iter().enumerate() {
             assert_eq!(
@@ -216,11 +239,7 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
         let claims_made = log
             .iter()
             .filter(|entry| {
-                entry.outcome.is_ok()
-                    && matches!(
-                        entry.command,
-                        Command::OpenQuote { .. } | Command::OpenRequest { .. }
-                    )
+                entry.outcome.is_ok() && matches!(entry.command, Command::SubmitRequest { .. })
             })
             .count();
         let claims_alive = engine.ledger().reservation_count() as usize;
@@ -229,7 +248,15 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
             rounds_with_expiry += 1;
         }
 
-        assert_eq!(events_dropped, 0, "this command set emits no events, so none can drop");
+        // The engine really emits now: every admitted request fans a `RequestOpened` out to
+        // makers, which is the step that makes the venue an RFQ (SPEC §5.2).
+        assert!(
+            events_emitted >= claims_made as u64,
+            "iteration {iteration}: {events_emitted} events for {claims_made} admitted requests"
+        );
+        // Nothing is asserted about `events_dropped`: the ring is bounded and the publisher
+        // is scheduled independently, so a drop here would be the design working, not a bug.
+        let _ = events_dropped;
     }
 
     // The interleaving assertion (CLAUDE 39). A sequential scheduler gives exactly
@@ -259,7 +286,7 @@ fn the_same_round_runs_on_the_shipping_clock() {
     // asserted here about normalisation — only that the loop runs, the log is complete and
     // ordered, and replay still reproduces the state.
     let outcome = concurrent_round(MonotonicClock::starting_at(Ts(1_000)));
-    let expected = (CLIENTS * COMMANDS_PER_CLIENT) as usize;
+    let expected = (CLIENTS * COMMANDS_PER_CLIENT) as usize + 1;
 
     assert_eq!(outcome.log.len(), expected);
     for (position, entry) in outcome.log.iter().enumerate() {
@@ -286,26 +313,39 @@ fn a_rejected_command_still_normalises_so_the_log_must_keep_it() {
     // The sequence is built so the rejected command is the only thing that ever touches
     // account 0 again after its claim dies:
     //
-    //   0  credit account 0 with 100
-    //   1  account 0 reserves all 100, live for 1 tick — dead by the time command 2 lands
-    //   2  account 0 tries to reserve 1_000 -> normalises the dead claim, then rejects
-    //   3  credit account 1 — touches a different account, so account 0 is never revisited
+    //   0  register the contract
+    //   1  credit account 0 with 100
+    //   2  account 0 opens a request reserving all 100, deadline at tick 3 — dead by the
+    //      time command 3 lands
+    //   3  account 0 asks for a request it cannot fund -> normalises the dead claim, rejects
+    //   4  credit account 1 — a different account, so account 0 is never revisited
+    let request = |size: u64, deadline: u64| {
+        let mut legs = [LegSpec::default(); MAX_LEGS];
+        legs[0] =
+            LegSpec { contract: CONTRACT, side: Side::Yes, size: Size(size), limit: Price(1) };
+        Command::SubmitRequest {
+            requester: AccountIdx(0),
+            deadline: Ts(deadline),
+            legs,
+            n_legs: 1,
+        }
+    };
+
     let venue = Venue::start(config(), TickClock::new(Ts(0), Dur(1)), NullSink, capacities())
         .unwrap();
     let sender = venue.commands();
+    sender
+        .send(Command::RegisterContract { contract: CONTRACT, event_date: EVENT_DATE })
+        .unwrap();
     sender.send(Command::CreditAccount { account: AccountIdx(0), free: Amount(100) }).unwrap();
-    sender
-        .send(Command::OpenQuote { maker: AccountIdx(0), amount: Amount(100), ttl: Dur(1) })
-        .unwrap();
-    sender
-        .send(Command::OpenQuote { maker: AccountIdx(0), amount: Amount(1_000), ttl: Dur(1) })
-        .unwrap();
+    sender.send(request(100, 3)).unwrap();
+    sender.send(request(1_000, 20)).unwrap();
     sender.send(Command::CreditAccount { account: AccountIdx(1), free: Amount(1) }).unwrap();
     drop(sender);
 
     let outcome = venue.join();
-    assert_eq!(outcome.log.len(), 4, "the rejected command must be in the log");
-    assert!(outcome.log[2].outcome.is_err(), "1_000 is more than the account holds");
+    assert_eq!(outcome.log.len(), 5, "the rejected command must be in the log");
+    assert!(outcome.log[3].outcome.is_err(), "1_000 is more than the account holds");
 
     // Its normalisation is the only reason account 0 holds nothing at the end.
     assert_eq!(outcome.engine.ledger().reservation_count(), 0);
@@ -322,7 +362,7 @@ fn a_rejected_command_still_normalises_so_the_log_must_keep_it() {
     // point: drop the rejected command and the dead claim is never reclaimed.
     let pruned: Vec<LogEntry> =
         outcome.log.iter().copied().filter(|entry| entry.outcome.is_ok()).collect();
-    assert_eq!(pruned.len(), 3);
+    assert_eq!(pruned.len(), 4);
     let from_pruned = replay(config(), &pruned, capacities().event_buffer).unwrap();
     assert_eq!(
         from_pruned.ledger().reservation_count(),
@@ -353,10 +393,12 @@ fn the_engine_keeps_applying_after_the_publisher_dies() {
         Venue::start(config(), TickClock::new(Ts(0), Dur(1)), DyingSink, capacities()).unwrap();
     let sender = venue.commands();
 
-    // Kill the publisher by handing it an event, then keep submitting.
-    if let Ok(mut ring) = venue.ring().lock() {
-        ring.push(rfq_core::event::Event::RequestOpened);
-    }
+    // The publisher dies on the first event the engine emits — and this stage's engine
+    // really does emit: registering the contract and opening a request produce events.
+    venue
+        .commands()
+        .send(Command::RegisterContract { contract: CONTRACT, event_date: EVENT_DATE })
+        .unwrap();
     for client in 0..CLIENTS {
         for command in client_commands(client) {
             sender.send(command).expect("the engine must still be accepting commands");
@@ -367,7 +409,7 @@ fn the_engine_keeps_applying_after_the_publisher_dies() {
     let outcome = venue.join();
     assert_eq!(
         outcome.log.len(),
-        (CLIENTS * COMMANDS_PER_CLIENT) as usize,
+        (CLIENTS * COMMANDS_PER_CLIENT) as usize + 1,
         "the engine stopped when the publisher did"
     );
     assert_eq!(outcome.coverage_violations, 0);

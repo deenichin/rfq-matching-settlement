@@ -8,22 +8,27 @@
 
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
-use rfq_core::event::Event;
 use rfq_runtime::event_ring::EventRing;
+
+/// The ring is indifferent to what it carries — its whole job is order, eviction and
+/// sequence continuity — so these tests carry integers. That is not a shortcut: it is the
+/// reason the ring is generic. Forging an `Event` here would mean forging a slab handle,
+/// and `Handle` has no `Default` precisely because a handle is a claim that something
+/// exists.
 
 #[test]
 fn a_full_ring_evicts_its_oldest_entry_rather_than_refusing_the_writer() {
     // Blocking the sole writer on a full queue would let one slow consumer stall the entire
     // venue — a denial vector strictly worse than the lost events it prevents. So `push`
     // has no failure mode at all: its return type is a sequence number, not a Result.
-    let mut ring = EventRing::with_capacity(3);
+    let mut ring: EventRing<u32> = EventRing::with_capacity(3);
     for _ in 0..3 {
-        ring.push(Event::RequestOpened);
+        ring.push(0);
     }
     assert_eq!(ring.len(), 3);
     assert_eq!(ring.dropped(), 0);
 
-    let sequence = ring.push(Event::QuoteRejected);
+    let sequence = ring.push(1);
     assert_eq!(sequence, 3, "the writer was served");
     assert_eq!(ring.len(), 3, "the ring did not grow");
     assert_eq!(ring.capacity(), 3);
@@ -41,9 +46,9 @@ fn sequence_numbers_are_assigned_to_dropped_events_too_so_gaps_are_visible() {
     // The whole mechanism. Numbering only the survivors would make a lossy queue
     // indistinguishable from a lossless one, and a consumer would have no way to know it
     // needs to resynchronise.
-    let mut ring = EventRing::with_capacity(2);
+    let mut ring: EventRing<u32> = EventRing::with_capacity(2);
     for _ in 0..10 {
-        ring.push(Event::RequestOpened);
+        ring.push(0);
     }
 
     let first = ring.pop().unwrap();
@@ -62,9 +67,9 @@ fn sequence_numbers_are_assigned_to_dropped_events_too_so_gaps_are_visible() {
 fn a_ring_that_is_kept_drained_never_drops() {
     // The precondition the drop path is measured against (CLAUDE 39): if this also dropped,
     // the test above would be showing eviction under conditions where any queue evicts.
-    let mut ring = EventRing::with_capacity(2);
+    let mut ring: EventRing<u32> = EventRing::with_capacity(2);
     for expected in 0..20 {
-        let sequence = ring.push(Event::BestSelectionChanged);
+        let sequence = ring.push(2);
         assert_eq!(sequence, expected);
         assert_eq!(ring.pop().unwrap().sequence, expected);
     }
@@ -74,15 +79,15 @@ fn a_ring_that_is_kept_drained_never_drops() {
 
 #[test]
 fn the_ring_wraps_without_losing_order() {
-    let mut ring = EventRing::with_capacity(4);
+    let mut ring: EventRing<u32> = EventRing::with_capacity(4);
     for _ in 0..3 {
-        ring.push(Event::RequestOpened);
+        ring.push(0);
     }
     assert_eq!(ring.pop().unwrap().sequence, 0);
     assert_eq!(ring.pop().unwrap().sequence, 1);
     // Head is now at index 2; pushing four more wraps the tail past it.
     for _ in 0..4 {
-        ring.push(Event::QuoteExpired);
+        ring.push(1);
     }
     assert_eq!(ring.len(), 4);
     assert_eq!(ring.dropped(), 1, "one of the five live entries had to go");

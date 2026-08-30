@@ -70,6 +70,9 @@ pub struct Config {
     pub max_requests: u32,
     /// Quote-slab capacity.
     pub max_quotes: u32,
+    /// Contract indices the table is preallocated for. Contracts are never freed, so this
+    /// is a hard ceiling on how many distinct descriptions the venue can ever trade (§5.3).
+    pub max_contracts: u32,
     /// Confirmation depth the balance mirror waits for. Zero in v1 (SPEC §2.3).
     ///
     /// A count, not a duration: it becomes one only when multiplied by `block_time`.
@@ -121,8 +124,13 @@ impl Config {
 
         // `u32::MAX` is the nil link threading the intrusive chains (SPEC §4.3), so no slab
         // may be large enough for a real index to collide with it.
-        let capacities =
-            [self.max_accounts, self.max_reservations, self.max_requests, self.max_quotes];
+        let capacities = [
+            self.max_accounts,
+            self.max_reservations,
+            self.max_requests,
+            self.max_quotes,
+            self.max_contracts,
+        ];
         if capacities.contains(&u32::MAX) {
             return Err(ConfigError::CapacityTooLarge);
         }
@@ -199,6 +207,7 @@ impl Default for Config {
             max_reservations: 4_096,
             max_requests: 1_024,
             max_quotes: 4_096,
+            max_contracts: 1_024,
         }
     }
 }

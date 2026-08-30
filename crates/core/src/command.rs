@@ -7,37 +7,49 @@
 //! indexer (SPEC §13.1).
 //!
 //! Nothing here names a **reservation**. Participants name a quote or a request; the claim
-//! backing it is the engine's bookkeeping, not an address a client can hold. That is why
-//! [`Command::OpenQuote`] creates the quote *and* its claim in one command rather than
-//! leaving a client to reserve against a handle it has no way to learn.
+//! backing it is the engine's bookkeeping, not an address a client can hold.
 //!
-//! This set is what the S1 ledger supports, and each variant is the ancestor of the S2
-//! command that will subsume it:
+//! Nothing here carries a **description** either. External identifiers — account keys,
+//! contract wording, resolution sources — exist only at the gateway, which converts them to
+//! dense indices before a command is ever built (§3, CLAUDE 11).
 //!
-//! | Here | Becomes | Adds |
-//! |---|---|---|
-//! | `CreditAccount` | an indexer-produced mirror update (S6) | confirmation depth, dedup |
-//! | `OpenQuote` | `SubmitQuote` (S2) | leg, side, price, size, the per-leg chain |
-//! | `OpenRequest` | `SubmitRequest` (S2) | legs, contracts, deadline, limit prices |
-//! | `CloseQuote` | the release half of the quote lifecycle (S2) | `Consumed`/`Released`, `QuoteRejected` |
-//! | `CommitQuote` | one step of `AcceptRequest`'s commit phase (S2) | selection, atomicity across legs |
-//!
-//! `RejectRequest`, `AcceptRequest`, `CancelQuote`, `PollSettlement`, `ReportOracleStatus`
-//! and `SettleEscrow` arrive with the stages that can apply them. A named variant nothing
-//! can execute is a stub, and a command log over an uninhabited enum proves nothing.
+//! `PollSettlement` (S4), `ReportOracleStatus` and `SettleEscrow` (S5) arrive with the
+//! stages that can apply them. A named variant nothing can execute is a stub.
 //!
 //! Authorisation is designed and not enforced: §16 excludes signatures, so "requester only"
 //! and "oracle adapter only" are the gateway's boundary, not the engine's.
 
 use crate::account::AccountIdx;
+use crate::config::MAX_LEGS;
+use crate::contract::ContractIdx;
 use crate::quote::QuoteIdx;
 use crate::request::ReqIdx;
-use crate::types::{Amount, Dur};
+use crate::types::{Amount, LegId, Price, Side, Size, Ts};
+
+/// One leg of a `SubmitRequest`: what to trade, which side, how much, and the most the
+/// requester will pay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LegSpec {
+    /// The contract, already resolved to an index by the gateway.
+    pub contract: ContractIdx,
+    /// The side the **requester** is buying. The maker takes the opposite (§2.1).
+    pub side: Side,
+    /// How many contracts. A fill is all of it or none of it.
+    pub size: Size,
+    /// The limit. Never broadcast, never checked at admission, enforced at selection (§5.2).
+    pub limit: Price,
+}
+
+/// The requester's view of one leg at the moment they accepted (§7.1.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpectedFill {
+    /// Which leg.
+    pub leg: LegId,
+    /// The price the requester was shown.
+    pub price: Price,
+}
 
 /// A state-mutating request to the engine.
-///
-/// `Copy`, so the command log can hold the exact value that was applied without cloning it
-/// out of the money path (CLAUDE 12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     /// A chain event moved an account's balance; update the mirror (§2.3, §12).
@@ -50,43 +62,71 @@ pub enum Command {
         /// The new mirrored free balance.
         free: Amount,
     },
-    /// Open a quote and reserve `amount` of the maker's balance against it, live for `ttl`
-    /// from the sampled `now`.
+    /// Record a contract the gateway has just assigned an index to (§5.3).
     ///
-    /// A **duration**, not an instant: the expiry is derived from the `now` the engine
-    /// samples, which is what makes the command log's recorded instant load-bearing for
-    /// replay. A participant-supplied absolute timestamp would be advisory and never
-    /// trusted (§4.1).
-    OpenQuote {
+    /// The description that *is* the identity stays at the gateway; the core learns only the
+    /// index and the event date it needs for the `ContractTooNear` check.
+    RegisterContract {
+        /// The index the gateway assigned by byte equality over description, event date and
+        /// resolution source.
+        contract: ContractIdx,
+        /// When the event settles.
+        event_date: Ts,
+    },
+    /// Open a request and reserve `Σ size × limit` of the requester's balance against it
+    /// (§5.2), before any price exists.
+    SubmitRequest {
+        /// Who is asking.
+        requester: AccountIdx,
+        /// When quoting closes. There is no post-deadline acceptance window (§5.1).
+        deadline: Ts,
+        /// The legs. Fixed-size because `MAX_LEGS` is a compile-time storage bound (§3).
+        legs: [LegSpec; MAX_LEGS],
+        /// How many of them are real.
+        n_legs: u8,
+    },
+    /// The requester withdraws their request, releasing every standing quote on it (§11).
+    RejectRequest {
+        /// Which request.
+        request: ReqIdx,
+    },
+    /// A maker's firm offer on one leg, reserving `leg.size × (UNIT − price)` (§6).
+    ///
+    /// **Never refused on price.** A quote above the leg's limit is admitted, reserves
+    /// capital normally, and loses at selection.
+    SubmitQuote {
         /// The maker.
         maker: AccountIdx,
-        /// The maker's contribution.
-        amount: Amount,
-        /// How long the quote binds. `MAX_QUOTE_TTL` is enforced in S2, where a quote has
-        /// a price to bind at.
-        ttl: Dur,
-    },
-    /// Open a request and reserve the requester's claim against it, live for `ttl`.
-    OpenRequest {
-        /// The requester.
-        requester: AccountIdx,
-        /// The requester's reservation.
-        amount: Amount,
-        /// How long the request stands.
-        ttl: Dur,
-    },
-    /// A quote leaves the book: its claim is released and its slot freed.
-    CloseQuote {
-        /// The quote. A stale handle is refused, not silently resolved to the slot's new
-        /// occupant (§15.3).
-        quote: QuoteIdx,
-    },
-    /// Move a quote's claim `reserved → committed` into a request's committed list
-    /// (§2.4, §7.2).
-    CommitQuote {
-        /// The quote whose claim moves.
-        quote: QuoteIdx,
-        /// The request whose committed list receives it.
+        /// Which request.
         request: ReqIdx,
+        /// Which leg.
+        leg: LegId,
+        /// The price of the side the requester is buying.
+        price: Price,
+        /// How much the maker will fill. Must cover the leg in full.
+        size: Size,
+        /// When the offer stops binding. Absolute, and the maker's own exposure control.
+        expires_at: Ts,
+    },
+    /// Present as a **rejected** transition, not as an absent one (§6, §14).
+    ///
+    /// Quotes are irrevocable until expiry in v1, so this always fails — but it fails with
+    /// its own variant, and enabling cancellation later is a policy change rather than a
+    /// redesign.
+    CancelQuote {
+        /// The quote the maker wishes they had not written.
+        quote: QuoteIdx,
+    },
+    /// The requester accepts, carrying the per-leg prices they were shown (§7.1.1).
+    ///
+    /// Filled **at or better** than every expected price. A strictly better fill is accepted
+    /// silently; a worse one rejects the whole request with `PresentationStale`.
+    AcceptRequest {
+        /// Which request.
+        request: ReqIdx,
+        /// The requester's view, per leg.
+        expected: [ExpectedFill; MAX_LEGS],
+        /// How many legs the view covers. Must equal the request's leg count.
+        n_legs: u8,
     },
 }

@@ -1,39 +1,142 @@
-//! The event set (skeleton).
+//! The event set (SPEC §5.2, §7.1.1, §7.2).
 //!
-//! Events are the engine's only output. `apply` performs no I/O — not logging, not
-//! metrics, not `println!` (CLAUDE 8) — and writes into a caller-provided buffer whose
-//! headroom is checked in the CHECK phase (CLAUDE 9). The publisher does all I/O, and if
-//! it dies the engine keeps applying: the audit trail is best-effort, the state machine is
-//! authoritative (SPEC §13).
+//! Events are the engine's only output. `apply` performs no I/O — not logging, not metrics,
+//! not `println!` (CLAUDE 8) — and writes into a caller-provided buffer whose headroom is
+//! checked in the CHECK phase (CLAUDE 9). The publisher does all I/O, and if it dies the
+//! engine keeps applying: the audit trail is best-effort, the state machine is
+//! authoritative (§13).
 //!
-//! [`Event::SubmitIntent`] is the **only** path from the engine to custody (SPEC §13.1).
-//! It is an event rather than a call because settlement is never invoked inside the commit
-//! phase: a fallible custody call there would violate CLAUDE 18 in v1 and be impossible in
-//! v2, where settlement is a network round trip.
+//! [`Event::SubmitIntent`] is the **only** path from the engine to custody (§13.1). It is an
+//! event rather than a call because settlement is never invoked inside the commit phase: a
+//! fallible custody call there would violate CLAUDE 18 in v1 and be impossible in v2, where
+//! settlement is a network round trip. It therefore carries the **whole bundle** — custody
+//! cannot reach back into the engine to fetch what it is missing.
+
+use crate::account::AccountIdx;
+use crate::config::MAX_LEGS;
+use crate::contract::ContractIdx;
+use crate::quote::QuoteIdx;
+use crate::request::{Nonce, ReqIdx};
+use crate::types::{LegId, Price, Side, Size, Ts};
+
+/// One leg of a request, as broadcast to makers.
+///
+/// **No limit price.** Makers receive the terms they need to price and nothing more: a
+/// revealed reserve shades quotes toward the limit rather than toward the maker's true best
+/// price (§5.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenLeg {
+    /// The contract. The publisher resolves this to the verbatim description through the
+    /// gateway; the engine never holds a byte of it.
+    pub contract: ContractIdx,
+    /// The side the requester is buying, so a maker knows which side they would take.
+    pub side: Side,
+    /// How much.
+    pub size: Size,
+}
+
+/// One leg of a settlement bundle, as handed to custody.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntentLeg {
+    /// The contract the escrow forms on.
+    pub contract: ContractIdx,
+    /// The side the requester bought — what the payout mapping consumes (§10.3).
+    pub side: Side,
+    /// The size.
+    pub size: Size,
+    /// The winning maker.
+    pub maker: AccountIdx,
+    /// The fill price. Both contributions derive from it exactly: `size × price` and
+    /// `size × (UNIT − price)`, which sum to the notional with no division (§2.1).
+    pub fill_price: Price,
+    /// The winning quote's expiry. Custody revalidates it against **its own clock** (§9.1),
+    /// which is why the value travels with the bundle rather than being looked up.
+    pub quote_expiry: Ts,
+}
+
+/// Why a quote was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuoteRejectReason {
+    /// A better quote won the leg at accept (§7.2).
+    Outbid,
+    /// The maker replaced this quote with a better one of their own (§6).
+    Replaced,
+    /// The requester withdrew the request (§11).
+    RequestRejected,
+}
 
 /// Something the engine did, for whoever is listening.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A request is open: contract description, side, size and deadline, fanned out to
-    /// makers. **Never the limit price** (SPEC §5.2) — a revealed reserve shades quotes
-    /// toward the limit rather than toward the maker's best price. Without this event no
-    /// maker learns a request exists and the venue is not an RFQ. Payload: S2.
-    RequestOpened,
-    /// The best eligible selection changed, published to the requester on quote arrival —
-    /// the only point at which the engine emits it. The feed is eventually consistent by
-    /// construction: normalisation emits nothing, so an expiry surfaces on the next
-    /// command. Safe because accept binds at-or-better (SPEC §7.1.1). Payload: S2.
-    BestSelectionChanged,
-    /// A quote lost at selection and its reservation was released. Makers are never left
-    /// inferring the fate of their capital from silence (SPEC §7.2). Payload: S2.
-    QuoteRejected,
-    /// A quote died of expiry. Emitted **only** from the accept commit phase, where the
-    /// count is bounded by `MAX_LEGS × MAX_QUOTES_PER_LEG`; expiry outside that path is
-    /// silent, because normalisation's count is unbounded (SPEC §4.3). Payload: S2.
-    QuoteExpired,
-    /// The one engine-to-custody path: a bundle and its nonce, picked up by the settlement
-    /// adapter (SPEC §7.2, §13.1). Payload: S2/S3.
-    SubmitIntent,
+    /// A request is open. Fanned out to makers — **this is the step that makes the venue an
+    /// RFQ rather than a private negotiation**: without it no maker learns a request exists
+    /// (§5.2).
+    RequestOpened {
+        /// Which request.
+        request: ReqIdx,
+        /// When quoting closes.
+        deadline: Ts,
+        /// The legs, without their limit prices.
+        legs: [OpenLeg; MAX_LEGS],
+        /// How many are real.
+        n_legs: u8,
+    },
+    /// The best eligible selection on one leg changed, published to the requester on **quote
+    /// arrival** — the only point at which the engine emits it (§7.1.1).
+    ///
+    /// The feed is eventually consistent by design. When the best quote expires and nothing
+    /// new arrives, no event is published: normalisation emits nothing, so the change
+    /// surfaces on the next command touching that request. That is safe rather than merely
+    /// tolerated, because an accept carries the prices the requester saw and fills
+    /// at-or-better — a stale view produces `PresentationStale`, never a bad fill.
+    ///
+    /// An ineligible quote is never selected and never published, so this can never carry a
+    /// price above the leg's limit.
+    BestSelectionChanged {
+        /// Which request.
+        request: ReqIdx,
+        /// Which leg.
+        leg: LegId,
+        /// The new best price.
+        price: Price,
+    },
+    /// A quote lost and its reservation was released. Makers are never left inferring the
+    /// fate of their capital from silence (§7.2).
+    QuoteRejected {
+        /// The quote.
+        quote: QuoteIdx,
+        /// Its maker, so the publisher can route the notice.
+        maker: AccountIdx,
+        /// Why.
+        reason: QuoteRejectReason,
+    },
+    /// A quote died of expiry.
+    ///
+    /// Emitted **only** from the accept commit phase, where the count is bounded by
+    /// `MAX_LEGS × MAX_QUOTES_PER_LEG`. Expiry outside that path is silent, because
+    /// normalisation's count is unbounded (§4.3).
+    QuoteExpired {
+        /// The quote.
+        quote: QuoteIdx,
+        /// Its maker.
+        maker: AccountIdx,
+    },
+    /// The one engine-to-custody path: a complete bundle and its nonce (§7.2, §13.1).
+    ///
+    /// Escrow does not exist yet. It appears when settlement confirms (§8, §9.1); until then
+    /// both sides' capital is `committed` and may not be released on a guess (§8.3).
+    SubmitIntent {
+        /// The request being settled.
+        request: ReqIdx,
+        /// `(ReqIdx, generation)` — unique and deterministic without hashing (§8.1).
+        nonce: Nonce,
+        /// The requester, who is debited `Σ size × fill_price`.
+        requester: AccountIdx,
+        /// The legs.
+        legs: [IntentLeg; MAX_LEGS],
+        /// How many are real.
+        n_legs: u8,
+    },
 }
 
 /// The caller-provided event buffer (CLAUDE 9, SPEC §13).

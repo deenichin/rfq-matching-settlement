@@ -23,8 +23,9 @@
 
 use crate::account::{AccountIdx, Link, MirroredBalance};
 use crate::config::Config;
-use crate::quote::{Quote, QuoteIdx};
-use crate::request::{ReqIdx, Request};
+use crate::contract::{Contract, ContractIdx};
+use crate::quote::{Quote, QuoteIdx, QuoteState};
+use crate::request::{ReqIdx, Request, RequestState};
 use crate::reservation::{ClaimLinks, ResIdx, ResOwner, Reservation};
 use crate::slab::Slab;
 use crate::types::{Amount, Ts};
@@ -81,6 +82,11 @@ pub enum LedgerError {
     InsufficientFree,
     /// Checked arithmetic on a total overflowed. A rejection, never a wrap (CLAUDE 14).
     AmountOverflow,
+    /// The contract index is outside the preallocated table, or was never registered.
+    UnknownContract,
+    /// A contract index was re-registered with a different event date. The event date is
+    /// part of the contract's identity (§5.3), so this is the gateway contradicting itself.
+    ContractIdentityChanged,
 }
 
 /// A broken structural invariant (SPEC §15.1–§15.3).
@@ -119,6 +125,14 @@ pub enum InvariantViolation {
     /// §15.6 — the mirrored balance no longer covers the claims against it. The engine has
     /// promised capital custody does not hold.
     ClaimCoverageBroken(AccountIdx),
+    /// §15.3 — a `reserved` claim's owner is not standing: a quote that is no longer
+    /// `Active`, or a request that is no longer `Open`.
+    ReservedClaimOwnerNotStanding(ResIdx),
+    /// §15.3 — a `committed` claim names a quote that is not `Consumed`.
+    CommittedClaimOwnerNotConsumed(ResIdx),
+    /// §15.3 — a `committed` claim hangs off a request that is still `Open`, so capital is
+    /// in the in-flight bucket with nothing in flight (§2.4).
+    CommittedClaimRequestNotSettling(ResIdx),
 }
 
 /// The engine's claim ledger.
@@ -129,6 +143,9 @@ pub enum InvariantViolation {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Ledger {
     accounts: Vec<MirroredBalance>,
+    /// Dense, never freed, so no generation — the same argument as accounts (§5.3).
+    /// `None` means the gateway has not registered that index yet.
+    contracts: Vec<Option<Contract>>,
     reservations: Slab<Reservation>,
     requests: Slab<Request>,
     quotes: Slab<Quote>,
@@ -141,8 +158,11 @@ impl Ledger {
     pub fn new(config: &Config) -> Self {
         let mut accounts = Vec::with_capacity(config.max_accounts as usize);
         accounts.resize(config.max_accounts as usize, MirroredBalance::default());
+        let mut contracts = Vec::with_capacity(config.max_contracts as usize);
+        contracts.resize(config.max_contracts as usize, None);
         Self {
             accounts,
+            contracts,
             reservations: Slab::with_capacity(config.max_reservations),
             requests: Slab::with_capacity(config.max_requests),
             quotes: Slab::with_capacity(config.max_quotes),
@@ -203,26 +223,43 @@ impl Ledger {
 
     // ────────────────────────────── owners (§15.3) ──────────────────────────────
 
-    /// Open a request slot.
+    /// Record a contract the gateway has assigned an index to (§5.3).
+    ///
+    /// Re-registering the same index with the same event date is a no-op, because the
+    /// gateway resolves an identical description to the same index; re-registering it with a
+    /// *different* event date is refused, since the event date is part of the identity.
     ///
     /// # Errors
     ///
-    /// [`LedgerError::SlabExhausted`].
-    pub fn open_request(&mut self) -> Result<ReqIdx, LedgerError> {
-        self.requests
-            .insert(Request::new())
-            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Request })
+    /// [`LedgerError::UnknownContract`] if the index is outside the preallocated table,
+    /// [`LedgerError::ContractIdentityChanged`] if it is already registered differently.
+    pub fn register_contract(
+        &mut self,
+        contract: ContractIdx,
+        event_date: Ts,
+    ) -> Result<(), LedgerError> {
+        let entry =
+            self.contracts.get_mut(contract.0 as usize).ok_or(LedgerError::UnknownContract)?;
+        match entry {
+            Some(existing) if existing.event_date() == event_date => Ok(()),
+            Some(_) => Err(LedgerError::ContractIdentityChanged),
+            None => {
+                *entry = Some(Contract::new(event_date));
+                Ok(())
+            }
+        }
     }
 
-    /// Open a quote slot.
-    ///
-    /// # Errors
-    ///
-    /// [`LedgerError::SlabExhausted`].
-    pub fn open_quote(&mut self) -> Result<QuoteIdx, LedgerError> {
-        self.quotes
-            .insert(Quote::new())
-            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Quote })
+    /// A registered contract, if the index resolves.
+    #[must_use]
+    pub fn contract(&self, contract: ContractIdx) -> Option<&Contract> {
+        self.contracts.get(contract.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// How many contract indices the table is preallocated for.
+    #[must_use]
+    pub fn contract_capacity(&self) -> u32 {
+        u32::try_from(self.contracts.len()).unwrap_or(u32::MAX)
     }
 
     /// Free a quote slot.
@@ -274,6 +311,45 @@ impl Ledger {
     #[must_use]
     pub fn quote(&self, quote: QuoteIdx) -> Option<&Quote> {
         self.quotes.get(quote)
+    }
+
+    /// The handle naming whatever occupies quote slot `index`, for walking an intrusive leg
+    /// chain and recovering the generation-carrying handle it names (§3).
+    #[must_use]
+    pub fn quote_handle_at(&self, index: u32) -> Option<QuoteIdx> {
+        self.quotes.handle_at(index)
+    }
+
+    /// Live quotes. Fixed capacity; the allocation proxy of CLAUDE 25.
+    #[must_use]
+    pub fn quote_count(&self) -> u32 {
+        self.quotes.len()
+    }
+
+    /// Every live quote, in dense index order.
+    ///
+    /// A read model, not a query surface: §16 notes the engine can answer "what is my
+    /// capital locked against" and that nothing *exposes* it. This is the accessor the
+    /// scenario runner traces through and the tests assert over; no command reaches it, and
+    /// nothing on a mutating path calls it.
+    pub fn quotes(&self) -> impl Iterator<Item = (QuoteIdx, &Quote)> {
+        self.quotes.iter()
+    }
+
+    /// Every live request, in dense index order.
+    pub fn requests(&self) -> impl Iterator<Item = (ReqIdx, &Request)> {
+        self.requests.iter()
+    }
+
+    /// Every live claim, in dense index order.
+    pub fn reservations(&self) -> impl Iterator<Item = (ResIdx, &Reservation)> {
+        self.reservations.iter()
+    }
+
+    /// Live requests.
+    #[must_use]
+    pub fn request_count(&self) -> u32 {
+        self.requests.len()
     }
 
     /// A claim, if the handle resolves. `None` means the handle is stale (§15.3).
@@ -356,11 +432,14 @@ impl Ledger {
     /// [`LedgerError::AmountOverflow`], [`LedgerError::SlabExhausted`].
     pub fn open_quote_reserving(
         &mut self,
-        account: AccountIdx,
+        record: Quote,
         amount: Amount,
-        expires_at: Ts,
     ) -> Result<(QuoteIdx, ResIdx), LedgerError> {
         // ── PLAN / CHECK ──
+        // The claim expires exactly when the quote does — one value, not two that could
+        // drift apart.
+        let expires_at = record.expires_at();
+        let account = record.maker();
         let reserved = self.check_reservable(account, amount)?;
         if !self.quotes.has_room() {
             return Err(LedgerError::SlabExhausted { slab: SlabKind::Quote });
@@ -375,7 +454,7 @@ impl Ledger {
         // assertions catch.
         let quote = self
             .quotes
-            .insert(Quote::new())
+            .insert(record)
             .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Quote })?;
         let owner = ResOwner::Quote(quote);
         let claim = self
@@ -399,11 +478,14 @@ impl Ledger {
     /// As [`Ledger::open_quote_reserving`].
     pub fn open_request_reserving(
         &mut self,
-        account: AccountIdx,
+        record: Request,
         amount: Amount,
-        expires_at: Ts,
     ) -> Result<(ReqIdx, ResIdx), LedgerError> {
         // ── PLAN / CHECK ──
+        // The requester's claim expires with the request: past the deadline the request is
+        // `Expired` (derived) and the capital is reclaimed by release-on-access (§5).
+        let expires_at = record.deadline();
+        let account = record.requester();
         let reserved = self.check_reservable(account, amount)?;
         if !self.requests.has_room() {
             return Err(LedgerError::SlabExhausted { slab: SlabKind::Request });
@@ -414,7 +496,7 @@ impl Ledger {
 
         let request = self
             .requests
-            .insert(Request::new())
+            .insert(record)
             .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Request })?;
         let owner = ResOwner::Request(request);
         let claim = self
@@ -780,6 +862,130 @@ impl Ledger {
     }
 }
 
+// ─────────────────────────── the commit phase (SPEC §7.2) ───────────────────────────
+
+impl Ledger {
+    /// Enter the commit phase.
+    ///
+    /// [`CommitPhase`] exposes **only infallible operations**, so CLAUDE 18's "no `?`, no
+    /// fallible call past this line" is enforced by the type rather than by review. Every
+    /// method on it documents the precondition the CHECK phase must already have
+    /// established.
+    pub const fn commit_phase(&mut self) -> CommitPhase<'_> {
+        CommitPhase { ledger: self }
+    }
+
+    /// A quote, mutably. Infallible in shape — the `Option` is a branch, not a `?`.
+    pub(crate) fn quote_mut(&mut self, quote: QuoteIdx) -> Option<&mut Quote> {
+        self.quotes.get_mut(quote)
+    }
+
+    /// A request, mutably.
+    pub(crate) fn request_mut(&mut self, request: ReqIdx) -> Option<&mut Request> {
+        self.requests.get_mut(request)
+    }
+}
+
+/// The commit phase of a command: infallible bookkeeping, and nothing else.
+///
+/// No method here returns a `Result`, so no `?` can appear and no early return can leave a
+/// command half applied. Where a precondition could in principle fail — a handle that no
+/// longer resolves, a claim already committed — the method `debug_assert`s and does nothing,
+/// because on a ledger whose CHECK phase has run those states are unreachable, and a partial
+/// mutation would be worse than a missed one.
+#[derive(Debug)]
+pub struct CommitPhase<'a> {
+    ledger: &'a mut Ledger,
+}
+
+impl CommitPhase<'_> {
+    /// Release a reserved claim and free its slot.
+    ///
+    /// Precondition, established in PLAN: `claim` resolves and is `reserved`.
+    pub fn release(&mut self, claim: ResIdx) {
+        let Some(reservation) = self.ledger.reservations.get(claim) else {
+            debug_assert!(false, "the commit phase released a claim that does not resolve");
+            return;
+        };
+        if reservation.is_committed() {
+            debug_assert!(false, "the commit phase released committed capital (SPEC §8.3)");
+            return;
+        }
+        let account = reservation.account();
+        let amount = reservation.amount();
+        let owner = reservation.owner();
+
+        self.ledger.unlink_from_chain(account, claim.index());
+        if let Some(entry) = self.ledger.accounts.get_mut(account.0 as usize) {
+            let reserved = Amount(entry.reserved().0.saturating_sub(amount.0));
+            entry.set_reserved(reserved);
+        }
+        self.ledger.set_owner_claim(owner, None);
+        self.ledger.reservations.remove(claim);
+        self.ledger.assert_invariants();
+    }
+
+    /// Move `keep` of a reserved claim to `committed` on `request`'s list, returning the
+    /// remainder to `free`.
+    ///
+    /// This is both halves of §7.2's commit step. The requester's claim is reserved at
+    /// `Σ size × limit` before any price exists, and fills at `Σ size × fill`, so the
+    /// over-reservation is released here rather than by a second command — one claim, one
+    /// transition, no window in which the difference belongs to neither bucket.
+    ///
+    /// Precondition, established in CHECK: `claim` resolves, is `reserved`, and
+    /// `keep <= claim.amount`.
+    pub fn commit(&mut self, claim: ResIdx, request: ReqIdx, keep: Amount) {
+        let Some(reservation) = self.ledger.reservations.get(claim) else {
+            debug_assert!(false, "the commit phase committed a claim that does not resolve");
+            return;
+        };
+        if reservation.is_committed() {
+            debug_assert!(false, "the commit phase committed an already-committed claim");
+            return;
+        }
+        debug_assert!(keep <= reservation.amount(), "CHECK must bound `keep` by the claim");
+        let account = reservation.account();
+        let reserved_before = reservation.amount();
+        let keep = Amount(keep.0.min(reserved_before.0));
+
+        self.ledger.unlink_from_chain(account, claim.index());
+        if let Some(reservation) = self.ledger.reservation_at_mut(claim.index()) {
+            reservation.set_amount(keep);
+        }
+        self.ledger.link_into_committed_list(request, claim.index());
+        if let Some(entry) = self.ledger.accounts.get_mut(account.0 as usize) {
+            let reserved = Amount(entry.reserved().0.saturating_sub(reserved_before.0));
+            let committed = Amount(entry.committed().0.saturating_add(keep.0));
+            entry.set_reserved(reserved);
+            entry.set_committed(committed);
+        }
+        self.ledger.assert_invariants();
+    }
+
+    /// Free a quote slot whose claim has already been released.
+    ///
+    /// Precondition: `quote` holds no claim.
+    pub fn close_quote(&mut self, quote: QuoteIdx) {
+        debug_assert!(
+            self.ledger.quotes.get(quote).is_some_and(|quote| quote.claim().is_none()),
+            "the commit phase freed an owner that still holds capital (SPEC §15.3)"
+        );
+        self.ledger.quotes.remove(quote);
+        self.ledger.assert_invariants();
+    }
+
+    /// A quote, mutably. Field writes only; nothing here can fail.
+    pub fn quote_mut(&mut self, quote: QuoteIdx) -> Option<&mut Quote> {
+        self.ledger.quote_mut(quote)
+    }
+
+    /// A request, mutably.
+    pub fn request_mut(&mut self, request: ReqIdx) -> Option<&mut Request> {
+        self.ledger.request_mut(request)
+    }
+}
+
 // ─────────────────────────── the invariants (SPEC §15.1–§15.3) ───────────────────────────
 
 impl Ledger {
@@ -802,6 +1008,17 @@ impl Ledger {
     ///
     /// The first [`InvariantViolation`] found.
     pub fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        self.check_structural_invariants()?;
+        self.check_claim_state_coherence()
+    }
+
+    /// The half of §15 that holds after **every mutation**: chain sums, chain shape, and the
+    /// bidirectional owner link.
+    ///
+    /// # Errors
+    ///
+    /// The first [`InvariantViolation`] found.
+    pub fn check_structural_invariants(&self) -> Result<(), InvariantViolation> {
         let mut chained: u32 = 0;
         chained = chained.saturating_add(self.check_expiry_chains()?);
         chained = chained.saturating_add(self.check_committed_lists()?);
@@ -815,6 +1032,79 @@ impl Ledger {
         }
 
         self.check_owners()
+    }
+
+    /// The half of §15.3 that holds after every **command**, not after every mutation: a
+    /// `reserved` claim references a standing quote or an open request, and a `committed`
+    /// claim references exactly one `Consumed` quote on a request in `Settling`, or that
+    /// request itself.
+    ///
+    /// Scoped to the command rather than the step, deliberately. A commit phase that moves
+    /// several claims has intermediate states by construction — the first winning maker's
+    /// claim is `committed` before the request has been marked `Settling`, because both
+    /// cannot happen in the same instruction. §15.4 already establishes that the observable
+    /// unit is the command, and asserting a whole-command property after every field write
+    /// would be asserting something the design never claimed.
+    ///
+    /// # Errors
+    ///
+    /// The first [`InvariantViolation`] found.
+    pub fn check_claim_state_coherence(&self) -> Result<(), InvariantViolation> {
+        for (claim, reservation) in self.reservations.iter() {
+            match (reservation.committed_to(), reservation.owner()) {
+                // A reserved maker claim backs a standing quote.
+                (None, ResOwner::Quote(quote)) => {
+                    let record =
+                        self.quotes.get(quote).ok_or(InvariantViolation::OwnerDoesNotResolve(claim))?;
+                    if !matches!(record.state(), QuoteState::Active) {
+                        return Err(InvariantViolation::ReservedClaimOwnerNotStanding(claim));
+                    }
+                }
+                // A reserved requester claim backs an open request.
+                (None, ResOwner::Request(request)) => {
+                    let record = self
+                        .requests
+                        .get(request)
+                        .ok_or(InvariantViolation::OwnerDoesNotResolve(claim))?;
+                    if !matches!(record.state(), RequestState::Open) {
+                        return Err(InvariantViolation::ReservedClaimOwnerNotStanding(claim));
+                    }
+                }
+                // A committed maker claim backs a Consumed quote on the settling request.
+                (Some(list), ResOwner::Quote(quote)) => {
+                    let record =
+                        self.quotes.get(quote).ok_or(InvariantViolation::OwnerDoesNotResolve(claim))?;
+                    if !matches!(record.state(), QuoteState::Consumed) {
+                        return Err(InvariantViolation::CommittedClaimOwnerNotConsumed(claim));
+                    }
+                    if record.request() != list {
+                        return Err(InvariantViolation::ClaimOnForeignCommittedList(list));
+                    }
+                    self.require_settling(list, claim)?;
+                }
+                // A committed requester claim is on its own request's list.
+                (Some(list), ResOwner::Request(request)) => {
+                    if request != list {
+                        return Err(InvariantViolation::ClaimOnForeignCommittedList(list));
+                    }
+                    self.require_settling(list, claim)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_settling(
+        &self,
+        request: ReqIdx,
+        claim: ResIdx,
+    ) -> Result<(), InvariantViolation> {
+        let record =
+            self.requests.get(request).ok_or(InvariantViolation::OwnerDoesNotResolve(claim))?;
+        if matches!(record.state(), RequestState::Open) {
+            return Err(InvariantViolation::CommittedClaimRequestNotSettling(claim));
+        }
+        Ok(())
     }
 
     /// §15.1, reserved half: every expiry chain is well-formed, ordered, and sums to its
@@ -1041,9 +1331,11 @@ impl Ledger {
         Ok(())
     }
 
+    /// Asserted after every ledger mutation, including inside a commit phase — so only the
+    /// structural half, which is the half that is true at every step.
     fn assert_invariants(&self) {
         if cfg!(debug_assertions)
-            && let Err(violation) = self.check_invariants()
+            && let Err(violation) = self.check_structural_invariants()
         {
             panic!("ledger invariant violated (SPEC §15): {violation:?}");
         }

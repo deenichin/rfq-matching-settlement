@@ -1,6 +1,14 @@
 //! S1 gate: the ledger's explicit tests (PLAN S1 (a)–(d)) and the claim-relationship
 //! invariants of SPEC §15.1–§15.3.
 //!
+//! These assert [`Ledger::check_structural_invariants`] — chain sums, chain shape, and the
+//! bidirectional owner link — which is the half that holds after **every mutation** and is
+//! what the ledger asserts internally. The other half of §15.3, that a committed claim names
+//! a `Consumed` quote on a `Settling` request, is a property of the *command* that produced
+//! it and belongs to the engine's tests: these exercise `Ledger::commit` directly, without
+//! the accept path that sets those states, so asserting it here would be asserting something
+//! about a caller that does not exist.
+//!
 //! The randomised gates live in `ledger_properties.rs`. These are the named cases: each one
 //! pins a specific sentence of the specification that a property test would exercise only by
 //! accident.
@@ -8,10 +16,13 @@
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
 use rfq_core::account::AccountIdx;
-use rfq_core::config::Config;
+use rfq_core::config::{Config, MAX_LEGS};
+use rfq_core::contract::ContractIdx;
 use rfq_core::ledger::{Ledger, LedgerError, SlabKind};
+use rfq_core::quote::{Quote, QuoteIdx};
+use rfq_core::request::{Leg, ReqIdx, Request};
 use rfq_core::reservation::ResOwner;
-use rfq_core::types::{Amount, Ts};
+use rfq_core::types::{Amount, LegId, Price, Side, Size, Ts};
 
 const ALICE: AccountIdx = AccountIdx(0);
 const BOB: AccountIdx = AccountIdx(1);
@@ -23,8 +34,9 @@ fn ledger(funded: u64) -> Ledger {
     let config = Config {
         max_accounts: 4,
         max_reservations: 8,
-        max_requests: 4,
-        max_quotes: 8,
+        max_requests: 16,
+        max_quotes: 16,
+        max_contracts: 2,
         ..Config::default()
     };
     let mut ledger = Ledger::new(&config);
@@ -32,9 +44,47 @@ fn ledger(funded: u64) -> Ledger {
     ledger
 }
 
-/// A quote owner holding no claim yet.
+/// A one-leg request record, for tests that need an owner rather than a market.
+fn request_record(deadline: Ts) -> Request {
+    let mut legs = [Leg::default(); MAX_LEGS];
+    legs[0] = Leg::new(ContractIdx(0), Side::Yes, Size(1), Price(1_000));
+    Request::new(ALICE, deadline, legs, 1)
+}
+
+/// A quote record on `request`, expiring at `expires_at`.
+fn quote_record(request: ReqIdx, expires_at: Ts) -> Quote {
+    Quote::new(ALICE, request, LegId(0), Price(1), Size(1), expires_at, 0)
+}
+
+/// Open a request holding **no claim of its own**, so tests can use it purely as an owner
+/// or as a committed list.
+///
+/// The ledger has no way to create an owner without a claim — the two move together, which
+/// is the point of `open_request_reserving` — so the claim is opened at zero and released.
+/// Zero rather than a token amount because accounts are funded to exactly what a test spends
+/// (CLAUDE 38), and a stray unit of slack would absorb an error.
+fn bare_request(ledger: &mut Ledger) -> ReqIdx {
+    let (request, claim) =
+        ledger.open_request_reserving(request_record(Ts(u64::MAX)), Amount::ZERO).unwrap();
+    ledger.release(claim).unwrap();
+    request
+}
+
+/// A quote owner holding no claim yet, on its own request.
 fn quote_owner(ledger: &mut Ledger) -> ResOwner {
-    ResOwner::Quote(ledger.open_quote().unwrap())
+    let request = bare_request(ledger);
+    let (quote, claim) =
+        ledger.open_quote_reserving(quote_record(request, Ts(u64::MAX)), Amount::ZERO).unwrap();
+    ledger.release(claim).unwrap();
+    ResOwner::Quote(quote)
+}
+
+/// The quote handle inside a `ResOwner::Quote`.
+fn quote_of(owner: ResOwner) -> QuoteIdx {
+    match owner {
+        ResOwner::Quote(quote) => quote,
+        ResOwner::Request(_) => unreachable!("this helper only builds quote owners"),
+    }
 }
 
 // ───────────────────────────── PLAN S1 gate (a) ─────────────────────────────
@@ -63,11 +113,11 @@ fn release_expired_reclaims_the_expired_prefix_and_leaves_the_total_equal_to_the
     // §15.2, scoped to the account just normalised.
     assert_eq!(ledger.check_normalised(ALICE, Ts(2_000)), Ok(()));
     // §15.1 in the chain-sum form, plus every structural invariant.
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     // The released owners no longer point at anything; the survivor still does.
-    assert!(ledger.quote(match owners[0] { ResOwner::Quote(q) => q, ResOwner::Request(_) => unreachable!() }).unwrap().claim().is_none());
-    assert!(ledger.quote(match owners[2] { ResOwner::Quote(q) => q, ResOwner::Request(_) => unreachable!() }).unwrap().claim().is_some());
+    assert!(ledger.quote(quote_of(owners[0])).unwrap().claim().is_none());
+    assert!(ledger.quote(quote_of(owners[2])).unwrap().claim().is_some());
 }
 
 // ───────────────────────────── PLAN S1 gate (b) ─────────────────────────────
@@ -106,7 +156,7 @@ fn a_stale_claim_handle_from_a_freed_slot_is_rejected_by_generation_mismatch() {
     assert_eq!(stale.index(), live.index(), "the test needs the slot to be reused");
     assert_ne!(stale.generation(), live.generation());
 
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     assert_eq!(ledger.reservation(stale), None);
     assert_eq!(ledger.release(stale), Err(LedgerError::StaleReservation));
     assert_eq!(ledger.commit(stale, request), Err(LedgerError::StaleReservation));
@@ -114,7 +164,7 @@ fn a_stale_claim_handle_from_a_freed_slot_is_rejected_by_generation_mismatch() {
     // And the stale operations did not disturb the live claim.
     assert_eq!(ledger.reservation(live).unwrap().amount(), Amount(60));
     assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(60));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 
@@ -128,7 +178,7 @@ fn releasing_committed_capital_is_a_different_error_from_a_stale_handle() {
     // may not be released on a guess (§8.3) — and must not share a variant.
     let mut ledger = ledger(100);
     let owner = quote_owner(&mut ledger);
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), owner).unwrap();
     ledger.commit(claim, request).unwrap();
 
@@ -145,7 +195,7 @@ fn commit_moves_a_claim_between_chains_in_one_step() {
     let mut ledger = ledger(300);
     let a = quote_owner(&mut ledger);
     let b = quote_owner(&mut ledger);
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let first = ledger.reserve(ALICE, Amount(100), Ts(1_000), a).unwrap();
     let second = ledger.reserve(ALICE, Amount(200), Ts(2_000), b).unwrap();
 
@@ -163,7 +213,7 @@ fn commit_moves_a_claim_between_chains_in_one_step() {
 
     // The survivor is still reserved and still expiring.
     assert_eq!(ledger.reservation(second).unwrap().expires_at(), Some(Ts(2_000)));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     // Committing twice is refused, and refused as *committed*, not as stale.
     assert_eq!(ledger.commit(first, request), Err(LedgerError::ReservationCommitted));
@@ -176,7 +226,7 @@ fn normalisation_cannot_reach_committed_capital() {
     let mut ledger = ledger(300);
     let committed_owner = quote_owner(&mut ledger);
     let reserved_owner = quote_owner(&mut ledger);
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let committed = ledger.reserve(ALICE, Amount(100), Ts(1_000), committed_owner).unwrap();
     let reserved = ledger.reserve(ALICE, Amount(200), Ts(1_000), reserved_owner).unwrap();
     ledger.commit(committed, request).unwrap();
@@ -188,7 +238,7 @@ fn normalisation_cannot_reach_committed_capital() {
     assert!(ledger.reservation(committed).is_some(), "committed capital survives its own expiry");
     assert_eq!(ledger.account(ALICE).unwrap().committed(), Amount(100));
     assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount::ZERO);
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 // ───────────────────────────── ordering and structure ─────────────────────────────
@@ -202,7 +252,7 @@ fn insertion_orders_the_chain_by_expiry_whatever_order_claims_arrive_in() {
     for (i, expiry) in [5_000_u64, 1_000, 4_000, 2_000, 3_000].into_iter().enumerate() {
         ledger.reserve(ALICE, Amount(100), Ts(expiry), owners[i]).unwrap();
     }
-    assert_eq!(ledger.check_invariants(), Ok(()), "chain-order is part of check_invariants");
+    assert_eq!(ledger.check_structural_invariants(), Ok(()), "chain-order is part of check_invariants");
 
     // Reclaiming from the head must come out in expiry order, one step at a time.
     for (now, expected_remaining) in [(1_000, 4), (2_000, 3), (3_000, 2), (4_000, 1), (5_000, 0)] {
@@ -219,11 +269,11 @@ fn unlinking_the_only_claim_clears_both_endpoints() {
     let first = quote_owner(&mut ledger);
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), first).unwrap();
     ledger.release(claim).unwrap();
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     let second = quote_owner(&mut ledger);
     ledger.reserve(ALICE, Amount(100), Ts(500), second).unwrap();
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
     assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(100));
 }
 
@@ -239,7 +289,7 @@ fn chains_are_per_account_and_do_not_interfere() {
     assert_eq!(ledger.release_expired(ALICE, Ts(5_000)).unwrap(), 1);
     assert_eq!(ledger.account(BOB).unwrap().reserved(), Amount(300), "Bob is untouched");
     assert!(ledger.reservation(bob_claim).is_some());
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 // ───────────────────────────── admission and exhaustion ─────────────────────────────
@@ -260,36 +310,46 @@ fn a_claim_beyond_the_mirrored_balance_is_refused() {
     // Rejection mutates nothing (§15.4).
     assert_eq!(ledger.reservation_count(), 1);
     assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(100));
-    assert!(ledger.quote(match second { ResOwner::Quote(q) => q, ResOwner::Request(_) => unreachable!() }).unwrap().claim().is_none());
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert!(ledger.quote(quote_of(second)).unwrap().claim().is_none());
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]
 fn slab_exhaustion_is_a_rejection_naming_the_slab() {
+    // Two reservation slots and three request slots, so both slabs run out and each names
+    // itself when it does.
     let config = Config {
         max_accounts: 2,
         max_reservations: 2,
-        max_requests: 1,
+        max_requests: 3,
         max_quotes: 8,
+        max_contracts: 2,
         ..Config::default()
     };
     let mut ledger = Ledger::new(&config);
     ledger.apply_mirror_update(ALICE, Amount(300)).unwrap();
-    for _ in 0..2 {
-        let owner = quote_owner(&mut ledger);
-        ledger.reserve(ALICE, Amount(100), Ts(1_000), owner).unwrap();
+
+    // Every owner first: opening one borrows a reservation slot and gives it straight back,
+    // so interleaving that with the claims below would exhaust the slab a step early and
+    // the test would be measuring its own fixture.
+    let owners: Vec<ResOwner> = (0..3).map(|_| quote_owner(&mut ledger)).collect();
+    for owner in owners.iter().take(2) {
+        ledger.reserve(ALICE, Amount(100), Ts(1_000), *owner).unwrap();
     }
 
-    let overflow = quote_owner(&mut ledger);
     assert_eq!(
-        ledger.reserve(ALICE, Amount(100), Ts(1_000), overflow),
+        ledger.reserve(ALICE, Amount(100), Ts(1_000), owners[2]),
         Err(LedgerError::SlabExhausted { slab: SlabKind::Reservation })
     );
     assert_eq!(ledger.reservation_capacity(), 2, "a rejection never grows the slab");
 
-    ledger.open_request().unwrap();
-    assert_eq!(ledger.open_request(), Err(LedgerError::SlabExhausted { slab: SlabKind::Request }));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    // The three owners took the three request slots, so the request slab names itself too —
+    // a distinct variant, because "which slab" is the first thing an operator needs.
+    assert_eq!(
+        ledger.open_request_reserving(request_record(Ts(u64::MAX)), Amount::ZERO),
+        Err(LedgerError::SlabExhausted { slab: SlabKind::Request })
+    );
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]
@@ -304,14 +364,14 @@ fn one_owner_holds_at_most_one_claim() {
         Err(LedgerError::OwnerAlreadyClaimed)
     );
 
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let requester = ResOwner::Request(request);
     ledger.reserve(ALICE, Amount(100), Ts(1_000), requester).unwrap();
     assert_eq!(
         ledger.reserve(ALICE, Amount(0), Ts(1_000), requester),
         Err(LedgerError::OwnerAlreadyClaimed)
     );
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]
@@ -319,18 +379,18 @@ fn a_requester_side_claim_has_no_quote() {
     // The reason `ResOwner` is an enum: the requester's `Σ size × limit_price` is reserved
     // at SubmitRequest, before any price exists and before any quote arrives (§4.3, §5.2).
     let mut ledger = ledger(100);
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), ResOwner::Request(request)).unwrap();
 
     assert_eq!(ledger.reservation(claim).unwrap().owner(), ResOwner::Request(request));
     assert_eq!(ledger.request(request).unwrap().claim(), Some(claim));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     // Committing the requester's own claim into its own request's list is the accept path
     // of §7.2, and the owner still points back afterwards.
     ledger.commit(claim, request).unwrap();
     assert_eq!(ledger.request(request).unwrap().claim(), Some(claim));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]
@@ -354,7 +414,7 @@ fn an_owner_holding_capital_cannot_be_closed_out_from_under_it() {
     // whatever is reissued into the slot, which is the stale-handle class the generation
     // counters exist to catch.
     let mut ledger = ledger(100);
-    let ResOwner::Quote(quote) = quote_owner(&mut ledger) else { unreachable!() };
+    let quote = quote_of(quote_owner(&mut ledger));
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), ResOwner::Quote(quote)).unwrap();
 
     assert_eq!(ledger.close_quote(quote), Err(LedgerError::OwnerStillClaimed));
@@ -363,7 +423,7 @@ fn an_owner_holding_capital_cannot_be_closed_out_from_under_it() {
     // Release first, then close. The ordering is the whole rule.
     ledger.release(claim).unwrap();
     assert_eq!(ledger.close_quote(quote), Ok(()));
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     // The handle is now stale, and reserving against it is refused on dereference.
     assert_eq!(ledger.quote(quote), None);
@@ -379,13 +439,13 @@ fn a_request_holding_committed_capital_cannot_be_closed() {
     // cannot be freed either — its committed list is the only thing that knows about it.
     let mut ledger = ledger(100);
     let owner = quote_owner(&mut ledger);
-    let request = ledger.open_request().unwrap();
+    let request = bare_request(&mut ledger);
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), owner).unwrap();
     ledger.commit(claim, request).unwrap();
 
     assert_eq!(ledger.close_request(request), Err(LedgerError::OwnerStillClaimed));
     assert!(ledger.request(request).is_some());
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]
@@ -394,20 +454,20 @@ fn releasing_a_claim_clears_the_owners_back_pointer() {
     // claim, the claim→owner direction would have nothing to look at — the claim is gone —
     // so only the reverse direction can catch it.
     let mut ledger = ledger(100);
-    let ResOwner::Quote(quote) = quote_owner(&mut ledger) else { unreachable!() };
+    let quote = quote_of(quote_owner(&mut ledger));
     let claim = ledger.reserve(ALICE, Amount(100), Ts(1_000), ResOwner::Quote(quote)).unwrap();
     assert_eq!(ledger.quote(quote).unwrap().claim(), Some(claim));
 
     ledger.release(claim).unwrap();
     assert_eq!(ledger.quote(quote).unwrap().claim(), None);
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 
     // The same, through bulk reclamation rather than a named release.
     let second = ledger.reserve(ALICE, Amount(100), Ts(2_000), ResOwner::Quote(quote)).unwrap();
     assert_eq!(ledger.quote(quote).unwrap().claim(), Some(second));
     assert_eq!(ledger.release_expired(ALICE, Ts(2_000)).unwrap(), 1);
     assert_eq!(ledger.quote(quote).unwrap().claim(), None);
-    assert_eq!(ledger.check_invariants(), Ok(()));
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 
 #[test]

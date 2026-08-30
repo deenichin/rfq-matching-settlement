@@ -17,20 +17,28 @@
 
 use rfq_core::event::Event;
 
-/// An event with the position it occupied in the total order.
+/// A payload with the position it occupied in the total order.
+///
+/// Generic over the payload, because none of the ring's properties — order, eviction,
+/// sequence continuity — depend on what it carries. Keeping it generic is also what lets the
+/// ring be tested without forging a slab handle: a handle is a claim that something exists,
+/// and `Handle` deliberately has no `Default` for exactly that reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SequencedEvent {
-    /// Position in the total order of every event the engine has ever emitted. Gaps mean
-    /// eviction, not reordering.
+pub struct Sequenced<T> {
+    /// Position in the total order of everything ever pushed. Gaps mean eviction, not
+    /// reordering.
     pub sequence: u64,
     /// What happened.
-    pub event: Event,
+    pub event: T,
 }
+
+/// The engine's events, sequenced.
+pub type SequencedEvent = Sequenced<Event>;
 
 /// A bounded ring that evicts its oldest entry rather than blocking its writer.
 #[derive(Debug)]
-pub struct EventRing {
-    slots: Vec<Option<SequencedEvent>>,
+pub struct EventRing<T = Event> {
+    slots: Vec<Option<Sequenced<T>>>,
     /// Index of the oldest live entry.
     head: usize,
     /// Live entries.
@@ -43,7 +51,7 @@ pub struct EventRing {
     shutdown: bool,
 }
 
-impl EventRing {
+impl<T: Clone> EventRing<T> {
     /// A ring holding `capacity` events. Preallocated; it never grows.
     ///
     /// # Panics
@@ -90,14 +98,14 @@ impl EventRing {
 
     /// Push an event, evicting the oldest if the ring is full. Returns the sequence number
     /// assigned. **Never blocks and never fails**, which is the point.
-    pub fn push(&mut self, event: Event) -> u64 {
+    pub fn push(&mut self, event: T) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
 
         let capacity = self.slots.len();
         let tail = wrap(self.head.checked_add(self.len).unwrap_or(0), capacity);
         if let Some(slot) = self.slots.get_mut(tail) {
-            *slot = Some(SequencedEvent { sequence, event });
+            *slot = Some(Sequenced { sequence, event });
         }
 
         if self.len == capacity {
@@ -127,7 +135,7 @@ impl EventRing {
     }
 
     /// Take the oldest waiting event.
-    pub fn pop(&mut self) -> Option<SequencedEvent> {
+    pub fn pop(&mut self) -> Option<Sequenced<T>> {
         if self.len == 0 {
             return None;
         }
