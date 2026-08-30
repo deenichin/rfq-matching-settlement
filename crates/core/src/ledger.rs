@@ -357,6 +357,17 @@ impl Ledger {
         self.reservations.iter()
     }
 
+    /// The handle naming whatever occupies request slot `index`.
+    ///
+    /// How a nonce becomes a request again (§8.1): the caller compares the generation it
+    /// carries with the one this returns, and a mismatch means the slot has been reused and
+    /// the nonce names nothing. No handle is constructed from outside — this hands back the
+    /// one the slab already holds.
+    #[must_use]
+    pub fn request_handle_at(&self, index: u32) -> Option<ReqIdx> {
+        self.requests.handle_at(index)
+    }
+
     /// Live requests.
     #[must_use]
     pub fn request_count(&self) -> u32 {

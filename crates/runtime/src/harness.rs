@@ -23,6 +23,8 @@ use rfq_chain::custody::{
     Custody, CustodyError, IncludedTx, SettleError, SettleReceipt, SubmitAck,
 };
 use rfq_chain::escrow::Escrow;
+use rfq_chain::indexer::Indexer;
+use rfq_chain::log::ChainPayload;
 use rfq_chain::oracle::Oracle;
 use rfq_core::account::{AccountIdx, MirroredBalance};
 use rfq_core::clock::{Clock, SettableClock};
@@ -32,7 +34,7 @@ use rfq_core::engine::{Engine, EngineError};
 use rfq_core::escrow::EscrowId;
 use rfq_core::event::{Event, EventBuffer};
 use rfq_core::request::ReqIdx;
-use rfq_core::contract::{ContractIdx, OracleStatus};
+use rfq_core::contract::{ContractIdx, OracleStatus, Outcome};
 use rfq_core::settlement::TxStatus;
 use rfq_core::types::{Amount, Ts};
 
@@ -75,7 +77,10 @@ pub struct Harness<EC: Clock, CC: Clock> {
     oracle: Oracle<CC>,
     /// Settlement intents the adapter has picked up and not yet applied.
     payouts: Vec<Event>,
-    /// Whether balance changes are being withheld from the engine's mirror.
+    /// The indexer: cursor, confirmation depth, dedup (§12). The **only** path from custody
+    /// back to the engine, and a real one — not a synchronous copy of a balance.
+    indexer: Indexer,
+    /// Whether the indexer is being left un-pumped, which is what a lagging one looks like.
     indexer_stalled: bool,
     /// Bundles that have been sent and whose nonce has no terminal answer yet.
     ///
@@ -129,6 +134,7 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             pending: Vec::new(),
             payouts: Vec::new(),
             escrows: Vec::new(),
+            indexer: Indexer::new(u64::from(config.confirmations)),
             indexer_stalled: false,
             in_flight: Vec::new(),
             emitted: Vec::new(),
@@ -213,7 +219,8 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         amount: Amount,
     ) -> Result<(), HarnessError> {
         self.custody.deposit(account, amount).map_err(HarnessError::Custody)?;
-        self.mirror(account)
+        self.pump_indexer();
+        Ok(())
     }
 
     /// Ask custody to release funds, and tell the engine that availability has dropped.
@@ -232,7 +239,7 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     ) -> Result<Ts, HarnessError> {
         let matures_at =
             self.custody.request_withdrawal(account, amount).map_err(HarnessError::Custody)?;
-        self.mirror(account)?;
+        self.pump_indexer();
         self.assert_cross_system_invariants();
         Ok(matures_at)
     }
@@ -245,7 +252,7 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     pub fn execute_withdrawal(&mut self, account: AccountIdx) -> Result<Amount, HarnessError> {
         let amount =
             self.custody.execute_withdrawal(account).map_err(HarnessError::Custody)?;
-        self.mirror(account)?;
+        self.pump_indexer();
         // The narrower set: a withdrawal can legitimately land on capital the engine has
         // already committed to a basket in flight, and the exit is that basket's settlement
         // failing (§2.4). Conservation, escrow contributions and mirror agreement hold
@@ -320,16 +327,13 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// nonce was ever sent — a submitter that has lost what it sent cannot retry, which is
     /// the one thing §8.1's answer depends on.
     pub fn resubmit(&mut self, request: ReqIdx) -> Result<SubmitAck, HarnessError> {
-        let nonce = self
-            .engine
-            .ledger()
-            .request(request)
-            .and_then(|record| record.state().nonce())
-            .ok_or(HarnessError::Engine(EngineError::RequestNotSettling))?;
+        // Found among what the submitter kept, not read out of engine state. A submitter
+        // that lost its acknowledgement does not know what the engine believes — that is the
+        // whole situation — so it resends the bundle it holds.
         let bundle = *self
             .in_flight
             .iter()
-            .find(|bundle| bundle.nonce == nonce)
+            .find(|bundle| bundle.nonce.request == request.index())
             .ok_or(HarnessError::Engine(EngineError::RequestNotSettling))?;
         Ok(self.custody.submit(bundle))
     }
@@ -357,8 +361,32 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         contract: ContractIdx,
     ) -> Result<OracleStatus, HarnessError> {
         let status = self.oracle.status(contract);
-        self.apply(Command::ReportOracleStatus { contract, status })?;
+        self.custody
+            .log_mut()
+            .append(ChainPayload::OracleStatusReported { contract, status });
+        self.pump_indexer();
         Ok(status)
+    }
+
+    /// Someone sends a transaction asking for an escrow to be paid out.
+    ///
+    /// `SettleEscrow` may be sent by anyone (§10.1), and on a chain that arrives as a log
+    /// entry — so it enters the engine the way every other outside fact does, through the
+    /// indexer, subject to the same confirmation depth and dedup.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke.
+    pub fn request_escrow_settlement(
+        &mut self,
+        escrow: EscrowId,
+        contract: ContractIdx,
+        outcome: Outcome,
+    ) {
+        self.custody
+            .log_mut()
+            .append(ChainPayload::EscrowSettled { escrow, contract, outcome });
+        self.pump_indexer();
     }
 
     /// Apply every settlement intent the adapter has picked up.
@@ -429,12 +457,17 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         self.include_all().into_iter().map(|tx| tx.outcome).collect()
     }
 
-    /// Read a request's nonce status the way a poller would, and hand it to the engine as a
-    /// command.
+    /// Ask about a nonce the way a poller would, and hand the answer to the engine.
     ///
-    /// This is the custody → engine wire. The engine is never given a reference to custody:
-    /// a fact is read on one side and delivered as a command on the other, which is the only
-    /// shape that survives custody being on another machine (§13.1).
+    /// **This cannot move a request out of `Settling`.** A terminal answer arrives through
+    /// the log, like every other fact the engine learns; what a poller can observe on its own
+    /// is `Unknown` or `Pending`, and neither moves anything. That split is deliberate: the
+    /// only path that changes engine state is the one with confirmation depth and dedup on
+    /// it, and a direct read can at most raise a stall alert.
+    ///
+    /// A real poller's read is an RPC, and an RPC is a synchronous call — so modelling it as
+    /// one is faithful rather than a shortcut. What matters is that nothing it returns is
+    /// trusted to end a settlement.
     ///
     /// # Errors
     ///
@@ -446,7 +479,14 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             return Err(HarnessError::Engine(EngineError::RequestNotSettling));
         };
         let status = self.custody.status(nonce);
-        self.apply(Command::PollSettlement { request, status })?;
+        if status.is_terminal() {
+            // Observed, and deliberately not delivered. A terminal answer is the chain's to
+            // announce, and it announces it in the log — where confirmation depth and dedup
+            // apply. Letting a direct read end a settlement would put the one state change
+            // that releases capital on the one path with neither.
+            return Ok(status);
+        }
+        self.apply(Command::PollSettlement { nonce, status })?;
         Ok(status)
     }
 
@@ -456,32 +496,71 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// `CreditAccount` command. S6 puts a real indexer in the middle — cursor, confirmation
     /// depth, dedup — and that is where the mirror stops being exact and starts being
     /// lagged (§2.3, §12).
-    fn mirror(&mut self, account: AccountIdx) -> Result<(), HarnessError> {
+    /// Read every confirmed, undelivered log entry and apply the commands it yields.
+    ///
+    /// This is the custody → engine wire, and it is the real one: cursor, confirmation depth
+    /// and dedup, not a synchronous copy of a balance. Everything the engine learns about the
+    /// outside world arrives this way.
+    ///
+    /// Returns how many commands were delivered.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke once the engine has caught up.
+    pub fn pump_indexer(&mut self) -> usize {
         if self.indexer_stalled {
-            return Ok(());
+            return 0;
         }
-        // Availability, not balance: this is the number admission is entitled to lend
-        // against (§9.1).
-        let free = self.custody.ledger().available(account);
-        let now = self.engine_clock.now();
-        self.events.clear();
-        self.engine
-            .apply(Command::CreditAccount { account, free }, now, &mut self.events)
-            .map_err(HarnessError::Engine)
+        let commands = self.indexer.drain(self.custody.log());
+        let delivered = commands.len();
+        for command in commands {
+            let now = self.engine_clock.now();
+            self.events.clear();
+            // A command from the indexer can legitimately be refused — an `EscrowSettled`
+            // arriving before the resolution it depends on is exactly that — and a refusal
+            // is the safety property working, not a wire failure.
+            let _ = self.engine.apply(command, now, &mut self.events);
+            let emitted: Vec<Event> = self.events.drain().collect();
+            for event in &emitted {
+                if let Some(bundle) = settlement::bundle_from(event) {
+                    self.pending.push(bundle);
+                }
+                if matches!(event, Event::SettleIntent { .. }) {
+                    self.payouts.push(*event);
+                }
+            }
+            self.emitted.extend(emitted);
+        }
+        self.assert_settlement_invariants();
+        delivered
+    }
+
+    /// Mine a block, then deliver whatever that made deep enough.
+    pub fn advance_block(&mut self) -> usize {
+        self.custody.log_mut().advance_block();
+        self.pump_indexer()
+    }
+
+    /// The indexer, read-only.
+    pub const fn indexer(&self) -> &Indexer {
+        &self.indexer
+    }
+
+    /// The indexer, for a test to rewind its cursor or forget what it has delivered.
+    pub const fn indexer_mut(&mut self) -> &mut Indexer {
+        &mut self.indexer
     }
 
     fn mirror_all(&mut self) {
-        for index in 0..self.custody.ledger().account_count() {
-            let _ = self.mirror(AccountIdx(index));
-        }
+        self.pump_indexer();
     }
 
-    /// Stop propagating custody's balance changes to the engine's mirror.
+    /// Stop pumping the indexer.
     ///
-    /// Models a non-zero `max_indexer_lag`: the chain has moved and the engine has not
-    /// heard. Staleness is the *only* thing that lets the engine admit against capital
-    /// already gone — with the §9.3 inequality holding and every lag term at zero, no
-    /// participant can withdraw out from under their own live claim, so an
+    /// A lagging indexer, modelled as what one actually is: the log keeps growing and
+    /// nothing reads it. Staleness is the *only* thing that lets the engine admit against
+    /// capital already gone — with the §9.3 inequality holding and every lag term at zero,
+    /// no participant can withdraw out from under their own live claim, so an
     /// insufficient-funds settlement is unreachable by construction.
     ///
     /// # Panics
@@ -496,42 +575,14 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         self.indexer_stalled = true;
     }
 
-    /// **Test-only.** Write a stale value into the engine's mirror, as a lagging indexer
-    /// would leave it.
-    ///
-    /// Only meaningful while the indexer is stalled: it puts the engine's view where a real
-    /// indexer's cursor would have left it, rather than requiring the test to have stalled
-    /// the wire before the balance moved.
-    ///
-    /// # Errors
-    ///
-    /// [`HarnessError::Engine`] if the engine refuses the update.
-    ///
-    /// # Panics
-    ///
-    /// If the indexer is not stalled. Writing a stale value into a mirror nothing is holding
-    /// back would be manufacturing a divergence the venue does not have.
-    pub fn mirror_stale_for_test(
-        &mut self,
-        account: AccountIdx,
-        free: Amount,
-    ) -> Result<(), HarnessError> {
-        assert!(self.indexer_stalled, "a stale mirror value needs a stalled indexer");
-        let now = self.engine_clock.now();
-        self.events.clear();
-        self.engine
-            .apply(Command::CreditAccount { account, free }, now, &mut self.events)
-            .map_err(HarnessError::Engine)
-    }
-
-    /// Resume propagation and catch the mirror up.
+    /// Resume pumping and catch the engine up.
     ///
     /// # Panics
     ///
     /// If a cross-system invariant broke once the engine has caught up.
     pub fn resume_indexer(&mut self) {
         self.indexer_stalled = false;
-        self.mirror_all();
+        self.pump_indexer();
         self.assert_settlement_invariants();
     }
 
@@ -583,13 +634,16 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         self.check_mirror_agreement()
     }
 
-    /// §15.5 alone, for a test asserting conservation across a payout that legitimately
-    /// leaves a core-side claim unbacked until the engine learns of it.
+    /// §15.5 alone.
+    ///
+    /// Read-only, and separable because conservation is the one invariant that holds through
+    /// every window the others leave open: it is purely custody-side, so nothing the engine
+    /// has or has not yet learned can affect it.
     ///
     /// # Errors
     ///
     /// [`CrossSystemViolation::ConservationBroken`].
-    pub fn check_conservation_for_test(&self) -> Result<(), CrossSystemViolation> {
+    pub fn check_conservation_only(&self) -> Result<(), CrossSystemViolation> {
         self.check_conservation()
     }
 
@@ -701,25 +755,59 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         Ok(())
     }
 
-    /// §15.7 — the engine's mirror equals custody, exactly, in v1.
+    /// §15.7 — the engine's mirror against custody.
     ///
     /// The mirror projects **availability**, not balance. Admission is forward-looking and
     /// must never lend against money already on its way out (§9.1), so the number the engine
     /// admits against is `balance − pending withdrawals`. Settlement asks the other question
-    /// and reads the balance directly; the two are different numbers on purpose, and the
-    /// mirror is the one admission uses.
+    /// and reads the balance directly.
+    ///
+    /// Two forms, and which one applies is a property of the configuration:
+    ///
+    /// - **No declared lag** — zero confirmations, zero indexer lag — the mirror is exact.
+    ///   Anything else is a bug in the wire.
+    /// - **Declared lag** — the mirror is a *prefix* of what the chain has published, so
+    ///   equality is false on a correct system and asserting it would be asserting the
+    ///   absence of the lag the configuration declares. What is asserted instead is that the
+    ///   engine has never invented a number: every mirrored value must be one the chain
+    ///   actually published for that account, or zero. A phantom credit is precisely a value
+    ///   that appears in the mirror and nowhere in the log.
+    ///
+    /// The time-domain bound §15.7 describes for v2 — drift no wider than the §9.3 lag
+    /// terms — is not asserted here, because this harness does not model delivery latency in
+    /// time. It models delivery *depth*, and the depth form is the one above.
     fn check_mirror_agreement(&self) -> Result<(), CrossSystemViolation> {
-        if self.indexer_stalled {
-            // Exact in v1 only because there is no lag. Under injected lag the assertion
-            // becomes bounded drift, and the bound is the §9.3 lag terms — which this
-            // harness does not model in time, so it does not pretend to check it.
-            return Ok(());
-        }
         let ledger = self.custody.ledger();
+        let config = self.engine.config();
+        let lagless = config.confirmations == 0
+            && config.max_indexer_lag == rfq_core::types::Dur::ZERO
+            && !self.indexer_stalled;
+
         for index in 0..ledger.account_count() {
             let account = AccountIdx(index);
             let Some(entry) = self.engine.ledger().account(account) else { continue };
-            if MirroredBalance::free(entry) != ledger.available(account) {
+            let mirrored = MirroredBalance::free(entry);
+
+            if lagless {
+                if mirrored != ledger.available(account) {
+                    return Err(CrossSystemViolation::MirrorDisagrees(account));
+                }
+                continue;
+            }
+
+            // Under lag: the mirror must be something the chain said, not something the
+            // engine made up.
+            if mirrored == Amount::ZERO {
+                continue;
+            }
+            let published = self.custody.log().entries().iter().any(|event| {
+                matches!(
+                    event.payload,
+                    ChainPayload::BalanceChanged { account: logged, available }
+                        if logged == account && available == mirrored
+                )
+            });
+            if !published {
                 return Err(CrossSystemViolation::MirrorDisagrees(account));
             }
         }

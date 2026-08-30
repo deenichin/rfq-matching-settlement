@@ -36,6 +36,7 @@ use rfq_core::types::{Amount, Dur, Ts};
 
 use crate::bundle::Bundle;
 use crate::escrow::Escrow;
+use crate::log::{ChainLog, ChainPayload};
 
 /// A hook fired on entry to a settlement transaction, before any validation.
 ///
@@ -198,6 +199,9 @@ pub struct CustodyLedger {
     withdrawal_delay: Dur,
     deposited: Amount,
     withdrawn: Amount,
+    /// The append-only log. **The only path back to the engine** (§12, §13.1): custody
+    /// writes what it did, and an indexer turns that into commands. Nothing calls across.
+    log: ChainLog,
 }
 
 impl CustodyLedger {
@@ -235,6 +239,26 @@ impl CustodyLedger {
     #[must_use]
     pub const fn withdrawn(&self) -> Amount {
         self.withdrawn
+    }
+
+    /// The chain log, read-only.
+    #[must_use]
+    pub const fn log(&self) -> &ChainLog {
+        &self.log
+    }
+
+    /// The chain log, for a test to mine blocks or force a reorg.
+    pub const fn log_mut(&mut self) -> &mut ChainLog {
+        &mut self.log
+    }
+
+    /// Record an account's new availability in the log.
+    ///
+    /// Availability rather than balance, because that is the number admission reads (§9.1),
+    /// and the mirror exists for admission.
+    fn log_balance(&mut self, account: AccountIdx) {
+        let available = self.available(account);
+        self.log.append(ChainPayload::BalanceChanged { account, available });
     }
 
     /// An escrow, if the id resolves.
@@ -297,6 +321,7 @@ impl CustodyLedger {
         let balance = entry.balance.checked_add(amount).ok_or(CustodyError::AmountOverflow)?;
         entry.balance = balance;
         self.deposited = deposited;
+        self.log_balance(account);
         Ok(())
     }
 
@@ -325,6 +350,9 @@ impl CustodyLedger {
         let matures_at = now.checked_add(delay).ok_or(CustodyError::AmountOverflow)?;
         entry.pending = amount;
         entry.matures_at = matures_at;
+        // Availability drops now, so the log carries the drop now. The balance has not moved
+        // and will not until maturity (§9.3).
+        self.log_balance(account);
         Ok(matures_at)
     }
 
@@ -362,6 +390,7 @@ impl CustodyLedger {
         entry.balance = Amount(entry.balance.0.saturating_sub(amount.0));
         entry.pending = Amount::ZERO;
         self.withdrawn = Amount(self.withdrawn.0.saturating_add(amount.0));
+        self.log_balance(account);
         Ok(amount)
     }
 
@@ -423,6 +452,9 @@ impl CustodyLedger {
                 entry.balance = Amount(entry.balance.0.saturating_add(amount.0));
             }
         }
+        for (account, _) in credits {
+            self.log_balance(account);
+        }
         if let Some(entry) = self.escrows.get_mut(id.0 as usize) {
             *entry = Escrow::locked(
                 escrow.contract(),
@@ -483,6 +515,7 @@ impl<C: Clock> Custody<C> {
                 withdrawal_delay,
                 deposited: Amount::ZERO,
                 withdrawn: Amount::ZERO,
+                log: ChainLog::new(),
             },
             on_settle_entry: None,
         }
@@ -511,6 +544,16 @@ impl<C: Clock> Custody<C> {
     /// Balances, escrows and nonces, for the operations that need no clock.
     pub const fn ledger_mut(&mut self) -> &mut CustodyLedger {
         &mut self.ledger
+    }
+
+    /// The chain log, read-only.
+    pub const fn log(&self) -> &ChainLog {
+        self.ledger.log()
+    }
+
+    /// The chain log, for a test to mine blocks or force a reorg.
+    pub const fn log_mut(&mut self) -> &mut ChainLog {
+        self.ledger.log_mut()
     }
 
     /// Credit an account.
@@ -609,6 +652,9 @@ impl<C: Clock> Custody<C> {
                 entry.balance = Amount(entry.balance.0.saturating_sub(amount.0));
             }
         }
+        for (account, _) in debits.entries() {
+            self.ledger.log_balance(account);
+        }
         let mut escrows = [EscrowId(0); rfq_core::config::MAX_LEGS];
         for (index, leg) in bundle.legs().iter().enumerate() {
             let id = EscrowId(u32::try_from(self.ledger.escrows.len()).unwrap_or(u32::MAX));
@@ -674,7 +720,11 @@ impl<C: Clock> Custody<C> {
         };
         // `settle` records `Settled` itself; a revert is recorded here, and both are final.
         self.ledger.resolved.entry(nonce).or_insert(status);
-        Some(IncludedTx { nonce, outcome, status: self.ledger.status(nonce) })
+        let status = self.ledger.status(nonce);
+        // Announce it. This is what moves a request out of `Settling`, and it travels the
+        // log like every other fact — no engine path reads a status from here.
+        self.ledger.log.append(ChainPayload::SettlementResolved { nonce, status });
+        Some(IncludedTx { nonce, outcome, status })
     }
 
     /// Include everything queued, oldest first.

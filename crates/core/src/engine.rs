@@ -99,6 +99,9 @@ pub enum EngineError {
     // ── AcceptRequest (§7) ──
     /// The accept's view covers a different number of legs than the request has.
     LegCountMismatch,
+    /// A poll named a nonce whose request slot has been freed and reissued, so it names a
+    /// request that no longer exists (§8.1).
+    StaleNonce,
     /// A poll named a request that is not `Settling`. There is no nonce to report on, and a
     /// terminal request must not be moved again (§8.1's monotonicity, one level up).
     RequestNotSettling,
@@ -254,8 +257,8 @@ impl Engine {
             Command::AcceptRequest { request, expected, n_legs } => {
                 self.accept_request(request, &expected, n_legs, now, events)
             }
-            Command::PollSettlement { request, status } => {
-                self.poll_settlement(request, status, now, events)
+            Command::PollSettlement { nonce, status } => {
+                self.poll_settlement(nonce, status, now, events)
             }
             Command::ReportOracleStatus { contract, status } => {
                 self.report_oracle_status(contract, status, events)
@@ -303,8 +306,14 @@ impl Engine {
             }
             Command::RejectRequest { request }
             | Command::AcceptRequest { request, .. }
-            | Command::PollSettlement { request, .. } => {
+             => {
                 touched[0] = self.ledger.request(request).map(Request::requester);
+            }
+            Command::PollSettlement { nonce, .. } => {
+                touched[0] = self
+                    .resolve_nonce(nonce)
+                    .and_then(|request| self.ledger.request(request))
+                    .map(Request::requester);
             }
             Command::CancelQuote { quote } => {
                 touched[0] = self.ledger.quote(quote).map(Quote::maker);
@@ -729,16 +738,23 @@ impl Engine {
     /// that revert never reaches here (§8.1).
     fn poll_settlement(
         &mut self,
-        request: ReqIdx,
+        reported: Nonce,
         status: TxStatus,
         now: Ts,
         events: &mut EventBuffer,
     ) -> Result<(), EngineError> {
         // ── PLAN / CHECK ──
+        let request = self.resolve_nonce(reported).ok_or(EngineError::StaleNonce)?;
         let record = *self.ledger.request(request).ok_or(EngineError::UnknownRequest)?;
         let RequestState::Settling { nonce, deadline } = record.state() else {
             return Err(EngineError::RequestNotSettling);
         };
+        if nonce != reported {
+            // The slot is live and the generation matched, but the request has since been
+            // accepted again — impossible today, since accept happens once, and refused
+            // rather than assumed.
+            return Err(EngineError::StaleNonce);
+        }
 
         match status {
             TxStatus::Unknown | TxStatus::Pending => {
@@ -802,6 +818,17 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// The request a nonce names, if the slot is still occupied by the same generation.
+    ///
+    /// `(ReqIdx, req_generation)` is the nonce (§8.1). A request slot reused after its
+    /// predecessor was freed yields a different generation, so a nonce from the previous
+    /// occupant resolves to nothing rather than to its successor — which is the whole reason
+    /// the generation is in the nonce.
+    fn resolve_nonce(&self, nonce: Nonce) -> Option<ReqIdx> {
+        let handle = self.ledger.request_handle_at(nonce.request)?;
+        (handle.generation() == nonce.generation).then_some(handle)
     }
 
     /// Free the slots of every `Consumed` quote on a request whose claims have been

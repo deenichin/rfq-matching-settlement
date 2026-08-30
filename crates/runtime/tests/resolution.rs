@@ -117,8 +117,9 @@ fn escrowed_spread() -> (TestHarness, ReqIdx, [EscrowId; 2]) {
     harness.apply(Command::AcceptRequest { request, expected, n_legs: 2 }).unwrap();
 
     harness.submit_pending();
+    // Inclusion announces the resolution, the indexer delivers it, and the request reaches
+    // Escrowed without anybody asking.
     harness.include_all();
-    harness.poll_settlement(request).unwrap();
     assert_eq!(harness.locked_escrows().count(), 2);
     let escrows = [harness.escrows()[0], harness.escrows()[1]];
     (harness, request, escrows)
@@ -502,7 +503,6 @@ fn two_identical_positions_on_one_contract() -> (TestHarness, [EscrowId; 2]) {
     harness.apply(Command::AcceptRequest { request, expected, n_legs: 2 }).unwrap();
     harness.submit_pending();
     harness.include_all();
-    harness.poll_settlement(request).unwrap();
     let escrows = [harness.escrows()[0], harness.escrows()[1]];
     (harness, escrows)
 }
@@ -560,7 +560,7 @@ fn final_is_immutable_and_the_failure_it_prevents_is_invisible_to_every_invarian
     // consistent while the model came apart, which is the same shape as §8.1's lost
     // acknowledgement one level up. Monotonicity is the only thing standing in the way,
     // which is why it is a rule and not hygiene.
-    assert_eq!(harness.check_conservation_for_test(), Ok(()));
+    assert_eq!(harness.check_conservation_only(), Ok(()));
     assert_eq!(harness.locked_escrows().count(), 0);
 }
 

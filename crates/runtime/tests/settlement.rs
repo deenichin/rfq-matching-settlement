@@ -23,7 +23,8 @@ use rfq_core::request::{ReqIdx, RequestState};
 use rfq_core::reservation::ResOwner;
 use rfq_core::settlement::TxStatus;
 use rfq_core::types::{Amount, Dur, LegId, Price, Side, Size, Ts};
-use rfq_runtime::harness::Harness;
+use rfq_core::engine::EngineError;
+use rfq_runtime::harness::{Harness, HarnessError};
 
 const REQUESTER: AccountIdx = AccountIdx(0);
 const ALPHA: AccountIdx = AccountIdx(1);
@@ -172,14 +173,13 @@ fn a_settled_nonce_moves_the_request_to_escrowed_and_discharges_the_claims() {
         "the claims are still held"
     );
 
-    // The chain includes it.
+    // The chain includes it, announces the resolution, and the indexer delivers it. Nobody
+    // polls: a terminal answer is the chain's to report.
     let included = harness.include_all();
     assert_eq!(included.len(), 1);
     assert!(included[0].outcome.is_ok());
     assert_eq!(included[0].status, TxStatus::Settled);
     assert_eq!(harness.custody().ledger().escrows().count(), 3);
-
-    assert_eq!(harness.poll_settlement(request).unwrap(), TxStatus::Settled);
     assert_eq!(
         harness.engine().ledger().request(request).unwrap().state(),
         RequestState::Escrowed
@@ -197,9 +197,13 @@ fn a_settled_nonce_moves_the_request_to_escrowed_and_discharges_the_claims() {
     // Which closes the coverage window S3 left knowingly open (§15.6).
     assert_eq!(harness.check_cross_system_invariants(), Ok(()));
 
-    // A second poll on a terminal request is refused, and changes nothing.
+    // A poll on a terminal request is refused, and changes nothing. The log entry that
+    // already moved it cannot be replayed either — dedup saw it.
     let after = format!("{:?}", harness.engine().ledger());
     assert!(harness.poll_settlement(request).is_err());
+    assert_eq!(format!("{:?}", harness.engine().ledger()), after);
+    harness.indexer_mut().rewind();
+    assert_eq!(harness.pump_indexer(), 0);
     assert_eq!(format!("{:?}", harness.engine().ledger()), after);
 }
 
@@ -223,122 +227,48 @@ fn laggy_config() -> Config {
     }
 }
 
-/// One single-leg request, quoted by Alpha and accepted.
-fn one_leg_request(harness: &mut TestHarness, contract: ContractIdx, at: Ts) -> ReqIdx {
-    let mut legs = [LegSpec::default(); MAX_LEGS];
-    legs[0] = LegSpec { contract, side: Side::Yes, size: SIZE, limit: LIMIT_A };
-    harness
-        .apply(Command::SubmitRequest { requester: REQUESTER, deadline: DEADLINE, legs, n_legs: 1 })
-        .unwrap();
-    let request = harness
-        .engine()
-        .ledger()
-        .requests()
-        .filter(|(_, record)| matches!(record.state(), RequestState::Open))
-        .map(|(handle, _)| handle)
-        .last()
-        .unwrap();
-
-    harness.set_both_clocks(at);
-    harness
-        .apply(Command::SubmitQuote {
-            maker: ALPHA,
-            request,
-            leg: LegId(0),
-            price: FILL_A,
-            size: SIZE,
-            expires_at: Ts(20_000),
-        })
-        .unwrap();
-    let mut expected = [ExpectedFill::default(); MAX_LEGS];
-    expected[0] = ExpectedFill { leg: LegId(0), price: FILL_A };
-    harness.apply(Command::AcceptRequest { request, expected, n_legs: 1 }).unwrap();
-    request
-}
-
 #[test]
 fn a_reverted_nonce_fails_the_settlement_and_returns_every_claim_to_free() {
-    // Two requests, one maker, funded for exactly one of them. The first settles and the
-    // engine discharges its claims — but the indexer has not reported the balance change, so
-    // the engine still believes Alpha holds capital that is now in escrow. It admits the
-    // second quote against money that is already gone, and the second settlement reverts.
-    //
-    // That is the whole of §2.3's "the design must tolerate admitting against a stale view":
-    // a stale mirror causes a *failed settlement* — a liveness cost — and never a money-state
-    // error.
-    let mut harness = Harness::new(
-        Config { max_requests: 4, ..laggy_config() },
-        TestClock::at(Ts(1_000)),
-        TestClock::at(Ts(1_000)),
-        TestClock::at(Ts(1_000)),
-    )
-    .unwrap();
-    harness.deposit(REQUESTER, Amount(requester_contribution(LIMIT_A).0 * 2)).unwrap();
-    harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
-    for contract in [SEPTEMBER, OCTOBER] {
-        harness.apply(Command::RegisterContract { contract, event_date: EVENT_DATE }).unwrap();
-    }
+    // The revert is driven by **clock divergence**, not by missing funds. Venue time and
+    // chain time are separate (§9.1), and a quote the engine believes live can be expired at
+    // the custody layer — which is the one revert reachable under v1 defaults, since §9.3's
+    // inequality makes insufficient-funds unreachable and the log delivers a settlement's
+    // balance changes and its resolution together, so no lag can separate them.
+    let (mut harness, request) = accepted_market(config());
+    let nonce = nonce_of(&harness, request);
+    let committed_before = committed_claims(&harness, request);
+    assert_eq!(committed_before.len(), 4, "three makers and the requester");
 
-    let first = one_leg_request(&mut harness, SEPTEMBER, Ts(1_100));
-    harness.submit_pending();
-    harness.include_all();
-    harness.poll_settlement(first).unwrap();
-    assert_eq!(harness.engine().ledger().request(first).unwrap().state(), RequestState::Escrowed);
-    assert_eq!(harness.custody().ledger().balance(ALPHA), Amount::ZERO, "it is in escrow now");
+    // The chain runs ahead, past every quote's expiry. The engine is right by its own clock
+    // and the chain is right by its own; the transaction is judged by the chain's.
+    harness.custody_clock_mut().set(Ts(25_000));
+    let divergence = harness.custody_now().saturating_sub(harness.engine_now());
+    assert_ne!(divergence, Dur::ZERO, "the two clocks must actually disagree");
 
-    // From here the indexer is behind: the engine's mirror still shows Alpha's pre-settlement
-    // availability.
-    harness.stall_indexer();
-    harness.mirror_stale_for_test(ALPHA, maker_contribution(FILL_A)).unwrap();
-    assert_eq!(
-        harness.engine().ledger().account(ALPHA).unwrap().free(),
-        maker_contribution(FILL_A),
-        "the engine believes money custody no longer holds"
-    );
-
-    let second = one_leg_request(&mut harness, OCTOBER, Ts(1_200));
-    let nonce = nonce_of(&harness, second);
-    let committed_before = committed_claims(&harness, second);
-    assert_eq!(committed_before.len(), 2, "the maker and the requester");
-
+    let quotes: Vec<_> = harness.engine().ledger().quotes().map(|(handle, _)| handle).collect();
     harness.submit_pending();
     let included = harness.include_all();
-    assert_eq!(included[0].outcome, Err(SettleError::InsufficientFunds { account: ALPHA }));
+    assert_eq!(included[0].outcome, Err(SettleError::QuoteExpired { leg: 0 }));
     assert_eq!(included[0].status, TxStatus::Reverted);
     assert!(!harness.custody().ledger().nonce_used(nonce), "a revert consumes nothing");
+    assert_eq!(harness.custody().ledger().escrows().count(), 0, "no escrow formed");
 
-    // Coverage is an aggregate per account, not an attribution to a particular claim: Alpha's
-    // escrow from the first trade numerically backs the second basket's claim, so the
-    // aggregate still holds here even though the second trade is going nowhere. The window
-    // §15.6 names open is exercised where a revert actually leaves an account short — the
-    // custody gate's withdrawal cases.
-    assert_eq!(harness.check_cross_system_invariants(), Ok(()));
-
-    let quotes: Vec<_> = harness
-        .engine()
-        .ledger()
-        .quotes()
-        .filter(|(_, quote)| quote.request() == second)
-        .map(|(handle, _)| handle)
-        .collect();
-    assert_eq!(harness.poll_settlement(second).unwrap(), TxStatus::Reverted);
+    // The chain announced the revert and the indexer delivered it.
     assert_eq!(
-        harness.engine().ledger().request(second).unwrap().state(),
+        harness.engine().ledger().request(request).unwrap().state(),
         RequestState::SettlementFailed
     );
 
     // Every committed claim is back in free capital, both sides.
-    assert!(committed_claims(&harness, second).is_empty());
-    for account in [REQUESTER, ALPHA] {
-        assert_eq!(
-            harness.engine().ledger().account(account).unwrap().committed(),
-            Amount::ZERO,
-            "account {account:?}"
-        );
+    assert!(committed_claims(&harness, request).is_empty());
+    for account in [REQUESTER, ALPHA, BETA, GAMMA] {
+        let entry = harness.engine().ledger().account(account).unwrap();
+        assert_eq!(entry.committed(), Amount::ZERO, "account {account:?}");
+        assert_eq!(entry.reserved(), Amount::ZERO);
     }
 
-    // The maker was told their winning quote is unfilled and their capital is back — they are
-    // never left inferring the fate of their capital from silence (§7.2).
+    // Every maker was told their winning quote is unfilled and their capital is back. They
+    // are never left inferring the fate of their capital from silence (§7.2).
     let notified: Vec<AccountIdx> = harness
         .emitted()
         .iter()
@@ -349,22 +279,29 @@ fn a_reverted_nonce_fails_the_settlement_and_returns_every_claim_to_free() {
             _ => None,
         })
         .collect();
-    assert_eq!(notified, vec![ALPHA]);
+    assert_eq!(notified.len(), 3);
+    for maker in [ALPHA, BETA, GAMMA] {
+        assert!(notified.contains(&maker), "{maker:?} was not told");
+    }
     assert!(quotes.iter().all(|handle| harness.engine().ledger().quote(*handle).is_none()));
 
-    // The first request's escrows are untouched: a reverted basket takes nothing with it.
-    assert_eq!(harness.custody().ledger().escrows().count(), 1);
-    harness.resume_indexer();
+    // Nobody lost anything: the basket aborted whole and every balance is where it started.
+    assert_eq!(harness.custody().ledger().balance(ALPHA), maker_contribution(FILL_A));
+    assert_eq!(harness.custody().ledger().balance(BETA), maker_contribution(FILL_B));
+    assert_eq!(harness.custody().ledger().balance(GAMMA), maker_contribution(FILL_C));
     assert_eq!(harness.check_cross_system_invariants(), Ok(()));
+
+    // And it is terminal: the request cannot be re-accepted.
+    assert!(harness.poll_settlement(request).is_err());
 }
 
 #[test]
 fn insufficient_funds_at_settlement_is_unreachable_without_lag() {
-    // The other half of §9.3's consequence, and the reason the test above has to inject lag
-    // at all. Under v1 defaults no participant can withdraw out from under their own live
-    // claim: claim-then-withdraw leaves the claim strictly dead first, and
-    // withdraw-then-claim drops availability before the claim is admitted, so only what the
-    // remainder covers is ever promised.
+    // §9.3's consequence, and the reason the revert above is driven by clock divergence
+    // rather than by missing funds. Under v1 defaults no participant can withdraw out from
+    // under their own live claim: claim-then-withdraw leaves the claim strictly dead first,
+    // and withdraw-then-claim drops availability before the claim is admitted, so only what
+    // the remainder covers is ever promised.
     let config = config();
     let maker_window = config.max_quote_ttl;
     let requester_window = Dur(config.max_request_ttl.0 + config.max_settling_time.0);
@@ -419,7 +356,6 @@ fn an_unknown_nonce_holds_every_claim_and_commits_nothing_twice() {
     harness.resubmit(request).unwrap();
     let included = harness.include_all();
     assert!(included[0].outcome.is_ok());
-    assert_eq!(harness.poll_settlement(request).unwrap(), TxStatus::Settled);
     assert_eq!(
         harness.engine().ledger().request(request).unwrap().state(),
         RequestState::Escrowed
@@ -469,7 +405,10 @@ fn reaching_the_settling_deadline_alerts_and_releases_nothing() {
     // And it still settles afterwards, which is what makes holding the right answer.
     harness.resubmit(request).unwrap();
     harness.include_all();
-    assert_eq!(harness.poll_settlement(request).unwrap(), TxStatus::Settled);
+    assert_eq!(
+        harness.engine().ledger().request(request).unwrap().state(),
+        RequestState::Escrowed
+    );
     assert_eq!(harness.custody().ledger().escrows().count(), 3);
 }
 
@@ -493,10 +432,10 @@ fn a_retry_before_inclusion_is_applied_exactly_once() {
     assert_eq!(included[1].status, TxStatus::Settled, "the nonce did not change its mind");
 
     assert_eq!(harness.custody().ledger().escrows().count(), 3, "applied exactly once");
-    assert_eq!(harness.poll_settlement(request).unwrap(), TxStatus::Settled);
     assert_eq!(
         harness.engine().ledger().request(request).unwrap().state(),
-        RequestState::Escrowed
+        RequestState::Escrowed,
+        "and the engine was told once, by the chain"
     );
     assert_eq!(harness.check_cross_system_invariants(), Ok(()));
 }
@@ -541,8 +480,8 @@ fn a_retry_after_inclusion_reverts_on_its_own_nonce_and_that_is_not_a_failure() 
     );
     assert_eq!(harness.custody().status(nonce), TxStatus::Settled);
 
-    // The poller reads the nonce, not the submission, so the engine is told the truth.
-    assert_eq!(harness.poll_settlement(request).unwrap(), TxStatus::Settled);
+    // The chain announced the nonce's fate, not the submission's, so the engine was told
+    // the truth — and the retry's own revert announced nothing at all.
     assert_eq!(
         harness.engine().ledger().request(request).unwrap().state(),
         RequestState::Escrowed,
@@ -574,25 +513,8 @@ fn a_retry_after_a_revert_finds_reverted_and_a_retry_after_a_settle_finds_settle
 
     // Direction two: the nonce reverted. The retry reverts too, and the nonce says Reverted —
     // a different fact about the trade, reached through an identical-looking error.
-    let mut harness = Harness::new(
-        Config { max_requests: 4, ..laggy_config() },
-        TestClock::at(Ts(1_000)),
-        TestClock::at(Ts(1_000)),
-        TestClock::at(Ts(1_000)),
-    )
-    .unwrap();
-    harness.deposit(REQUESTER, Amount(requester_contribution(LIMIT_A).0 * 2)).unwrap();
-    harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
-    for contract in [SEPTEMBER, OCTOBER] {
-        harness.apply(Command::RegisterContract { contract, event_date: EVENT_DATE }).unwrap();
-    }
-    let first = one_leg_request(&mut harness, SEPTEMBER, Ts(1_100));
-    harness.submit_pending();
-    harness.include_all();
-    harness.poll_settlement(first).unwrap();
-    harness.stall_indexer();
-    harness.mirror_stale_for_test(ALPHA, maker_contribution(FILL_A)).unwrap();
-    let second = one_leg_request(&mut harness, OCTOBER, Ts(1_200));
+    let (mut harness, second) = accepted_market(config());
+    harness.custody_clock_mut().set(Ts(25_000));
     harness.submit_pending();
     let included = harness.include_all();
     assert_eq!(included[0].status, TxStatus::Reverted, "the precondition this needs");
@@ -609,8 +531,52 @@ fn a_retry_after_a_revert_finds_reverted_and_a_retry_after_a_settle_finds_settle
         TxStatus::Reverted,
         "and a different answer, which is where the difference belongs"
     );
-    // And the retry did not re-arm it: still no escrow for the second basket.
-    assert_eq!(harness.custody().ledger().escrows().count(), 1);
+    // And the retry did not re-arm it: a reverted nonce is terminal, so no escrow forms.
+    assert_eq!(harness.custody().ledger().escrows().count(), 0);
+}
+
+#[test]
+fn a_nonce_whose_generation_has_moved_on_names_nothing() {
+    // `(ReqIdx, req_generation)` is the nonce (§8.1), and the generation is not decoration.
+    // `PollSettlement` may be sent by anyone, so anyone can name a slot with the wrong
+    // generation — and that must resolve to nothing rather than to whatever occupies the
+    // slot now. Without the check, a nonce from a freed request would move its successor.
+    let (mut harness, request) = accepted_market(config());
+    let nonce = nonce_of(&harness, request);
+    let before = format!("{:?}", harness.engine().ledger());
+
+    for generation in [nonce.generation.wrapping_add(1), nonce.generation.wrapping_sub(1), 99] {
+        let forged = rfq_core::request::Nonce { request: nonce.request, generation };
+        assert_eq!(
+            harness.apply(Command::PollSettlement { nonce: forged, status: TxStatus::Settled }),
+            Err(HarnessError::Engine(EngineError::StaleNonce)),
+            "generation {generation} must name nothing"
+        );
+    }
+    // A settled answer for a nonce that does not exist moved nothing: the request is still
+    // Settling and every claim is still held.
+    assert_eq!(format!("{:?}", harness.engine().ledger()), before);
+    assert!(matches!(
+        harness.engine().ledger().request(request).unwrap().state(),
+        RequestState::Settling { .. }
+    ));
+
+    // A slot that has never been occupied names nothing either.
+    assert_eq!(
+        harness.apply(Command::PollSettlement {
+            nonce: rfq_core::request::Nonce { request: 99, generation: 0 },
+            status: TxStatus::Settled,
+        }),
+        Err(HarnessError::Engine(EngineError::StaleNonce))
+    );
+
+    // And the real nonce still works, so the check is discriminating rather than blanket.
+    harness.submit_pending();
+    harness.include_all();
+    assert_eq!(
+        harness.engine().ledger().request(request).unwrap().state(),
+        RequestState::Escrowed
+    );
 }
 
 // ═══════════════════ (f) invariant 3 throughout Settling ═══════════════════
@@ -655,11 +621,9 @@ fn a_committed_claim_names_a_consumed_quote_at_every_step_of_settling() {
     harness.set_both_clocks(Ts(1_200).checked_add(SETTLING_TIME).unwrap());
     harness.poll_settlement(request).unwrap();
     check(&harness);
-    harness.include_all();
-    check(&harness);
 
-    // Only the terminal poll ends it.
-    harness.poll_settlement(request).unwrap();
+    // Only the chain's terminal answer ends it.
+    harness.include_all();
     assert_eq!(
         harness.engine().ledger().request(request).unwrap().state(),
         RequestState::Escrowed

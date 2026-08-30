@@ -190,6 +190,16 @@ fn a_bundle_whose_funds_are_all_present_settles() {
     );
     assert_eq!(harness.custody().ledger().escrows().count(), 0);
 
+    // The nonce is read before settling: afterwards the chain has announced the resolution
+    // and the request is no longer Settling.
+    let nonce = harness
+        .engine()
+        .ledger()
+        .request(request)
+        .unwrap()
+        .state()
+        .nonce()
+        .expect("Settling");
     let outcomes = harness.settle_pending();
     assert_eq!(outcomes.len(), 1);
     let receipt = outcomes[0].expect("all funds are present");
@@ -222,13 +232,12 @@ fn a_bundle_whose_funds_are_all_present_settles() {
     assert_eq!(escrows[1].side(), Side::No);
     assert_eq!(escrows[2].side(), Side::Yes);
 
-    // The nonce is consumed, and it is the request's.
-    let RequestState::Settling { nonce, .. } =
-        harness.engine().ledger().request(request).unwrap().state()
-    else {
-        panic!("Settling");
-    };
+    // The nonce is consumed, and the request has reached Escrowed because the chain said so.
     assert!(harness.custody().ledger().nonce_used(nonce));
+    assert_eq!(
+        harness.engine().ledger().request(request).unwrap().state(),
+        RequestState::Escrowed
+    );
 
     harness.assert_cross_system_invariants();
 }
@@ -715,11 +724,11 @@ fn conservation_counts_locked_escrows_only() {
     // Conservation still holds with that escrow no longer counted: its notional is back in
     // the two balances, so counting it as well would read as newly created money.
     assert_eq!(harness.locked_escrows().count(), 2);
-    assert_eq!(harness.check_conservation_for_test(), Ok(()));
+    assert_eq!(harness.check_conservation_only(), Ok(()));
 
     // Re-settlement is a no-op, so replay is harmless (§9.2).
     assert_eq!(harness.custody_mut().ledger_mut().settle_escrow(first, SEPTEMBER, Outcome::Void), Ok(false));
-    assert_eq!(harness.check_conservation_for_test(), Ok(()));
+    assert_eq!(harness.check_conservation_only(), Ok(()));
 }
 
 #[test]

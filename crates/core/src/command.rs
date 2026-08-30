@@ -24,7 +24,7 @@ use crate::config::MAX_LEGS;
 use crate::contract::{ContractIdx, OracleStatus};
 use crate::escrow::EscrowId;
 use crate::quote::QuoteIdx;
-use crate::request::ReqIdx;
+use crate::request::{Nonce, ReqIdx};
 use crate::settlement::TxStatus;
 use crate::types::{Amount, LegId, Price, Side, Size, Ts};
 
@@ -161,9 +161,16 @@ pub enum Command {
     /// command carries no discretion, and a wrong status is a lying poller, which is the
     /// same trust boundary the oracle sits behind.
     PollSettlement {
-        /// Which request.
-        request: ReqIdx,
-        /// The fate of that request's nonce, as observed.
+        /// The nonce whose fate is being reported.
+        ///
+        /// Not a request handle: nothing outside the engine constructs one of those. The
+        /// nonce is `(ReqIdx, req_generation)` (§8.1), so it already names the slot and the
+        /// generation, and the engine resolves it against its own request slab exactly as
+        /// it validates any handle it issued. A nonce whose generation has moved on names a
+        /// request that no longer exists, and is refused rather than applied to whatever
+        /// occupies the slot now.
+        nonce: Nonce,
+        /// The fate of that nonce, as observed.
         status: TxStatus,
     },
     /// The requester accepts, carrying the per-leg prices they were shown (§7.1.1).

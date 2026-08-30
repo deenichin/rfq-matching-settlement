@@ -273,25 +273,24 @@ fn no_production_path_in_the_runtime_can_reach_the_harness() {
 }
 
 #[test]
-fn nothing_outside_a_test_names_a_test_only_affordance() {
-    // Named for what it is, so grep finds every caller. It must appear in `src` exactly
-    // once — at its definition, on the harness — and nowhere else. A second occurrence is a
-    // caller, and the only callers permitted are tests and scenarios.
-    let mut sites = Vec::new();
+fn the_harness_has_no_test_only_surface() {
+    // It had one: a way to write a stale value into the engine's mirror, needed while the
+    // custody-to-engine wire was a synchronous copy of a balance. With a real indexer —
+    // cursor, confirmation depth, dedup — staleness is produced by not reading the log, which
+    // is what lag is, so the affordance had nothing left to do.
+    //
+    // Asserted as an absence, because an affordance that exists will eventually be used, and
+    // the harness is the one structure that can see both systems.
     for crate_dir in ["core", "chain", "runtime", "scenarios"] {
         for (path, text) in sources(crate_dir) {
-            if mentions(&code_only(&text), "mirror_stale_for_test") {
-                sites.push(path);
+            let code = code_only(&text);
+            for marker in ["_for_test", "for_testing", "test_only"] {
+                assert!(
+                    !code.contains(marker),
+                    "{} carries a test-only affordance ({marker})",
+                    path.display()
+                );
             }
         }
     }
-    assert_eq!(
-        sites.len(),
-        1,
-        "a test-only affordance is named in production code at {sites:?}"
-    );
-    assert!(
-        sites[0].ends_with("harness.rs"),
-        "the definition moved off the harness, which is the only place it may live"
-    );
 }

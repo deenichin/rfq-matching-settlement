@@ -20,6 +20,8 @@
 pub mod bundle;
 pub mod custody;
 pub mod escrow;
+pub mod indexer;
+pub mod log;
 pub mod oracle;
 
 pub use bundle::{Bundle, BundleLeg};
@@ -28,4 +30,6 @@ pub use custody::{
     SettleReceipt, SubmitAck,
 };
 pub use escrow::{Escrow, EscrowState};
+pub use indexer::Indexer;
+pub use log::{ChainEvent, ChainLog, ChainPayload, TxHash};
 pub use oracle::{Oracle, OracleError};
