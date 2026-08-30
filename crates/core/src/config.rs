@@ -57,6 +57,19 @@ pub struct Config {
     /// Delay between `RequestWithdrawal` and execution (SPEC §9.3). The first term of the
     /// inequality below and the reason soft reservation is safe at all.
     pub withdrawal_delay: Dur,
+    /// Accounts the balance mirror is preallocated for. Accounts are never freed, so
+    /// this is a hard ceiling on how many the venue can ever address (SPEC §3).
+    pub max_accounts: u32,
+    /// Reservation-slab capacity. Exhaustion is `SlabExhausted`, never a grow (SPEC §4.3).
+    ///
+    /// Every live claim locks real capital, so in practice an account cannot hold more open
+    /// quotes than its balance supports — the slab bounds the pathological case, not the
+    /// normal one.
+    pub max_reservations: u32,
+    /// Request-slab capacity.
+    pub max_requests: u32,
+    /// Quote-slab capacity.
+    pub max_quotes: u32,
     /// Confirmation depth the balance mirror waits for. Zero in v1 (SPEC §2.3).
     ///
     /// A count, not a duration: it becomes one only when multiplied by `block_time`.
@@ -79,6 +92,8 @@ pub enum ConfigError {
     MaxLegsExceedsStorage,
     /// `max_quotes_per_leg` exceeds the compile-time storage bound [`MAX_QUOTES_PER_LEG`].
     MaxQuotesPerLegExceedsStorage,
+    /// A preallocated capacity is `u32::MAX`, which is reserved as the nil chain link.
+    CapacityTooLarge,
     /// `max_request_ttl + max_settling_time` overflows.
     HorizonTermOverflow,
     /// `MIN_HORIZON > MAX_REQUEST_TTL + MAX_SETTLING_TIME` does not hold (SPEC §5.2).
@@ -102,6 +117,14 @@ impl Config {
         }
         if usize::from(self.max_quotes_per_leg) > MAX_QUOTES_PER_LEG {
             return Err(ConfigError::MaxQuotesPerLegExceedsStorage);
+        }
+
+        // `u32::MAX` is the nil link threading the intrusive chains (SPEC §4.3), so no slab
+        // may be large enough for a real index to collide with it.
+        let capacities =
+            [self.max_accounts, self.max_reservations, self.max_requests, self.max_quotes];
+        if capacities.contains(&u32::MAX) {
+            return Err(ConfigError::CapacityTooLarge);
         }
 
         // SPEC §5.2. A request opened at the last legal instant, accepted at its deadline
@@ -168,6 +191,14 @@ impl Default for Config {
             block_time: Dur::ZERO,
             max_indexer_lag: Dur::ZERO,
             max_settlement_inclusion_time: Dur::ZERO,
+            // Preallocated storage. A request and a quote each back at most one claim, so a
+            // reservation slab of `max_requests + max_quotes` could never be exhausted;
+            // these are sized below that deliberately, because `SlabExhausted` must stay a
+            // reachable rejection rather than a theoretical one.
+            max_accounts: 256,
+            max_reservations: 4_096,
+            max_requests: 1_024,
+            max_quotes: 4_096,
         }
     }
 }

@@ -232,6 +232,40 @@ impl<T> Slab<T> {
         }
     }
 
+    /// The handle naming whatever occupies `index`, or `None` if the slot is vacant.
+    ///
+    /// Intrusive chains are threaded with bare `u32` links (§4.3), because a link the
+    /// structure maintains itself cannot go stale — if it could, the structure is already
+    /// corrupt and a generation would not save it. Walking such a chain and then checking a
+    /// *cross-structure* reference against it needs the full handle, and this recovers it.
+    #[must_use]
+    pub fn handle_at(&self, index: u32) -> Option<Handle<T>> {
+        let slot = self.slots.get(index as usize)?;
+        match slot.state {
+            SlotState::Occupied(_) => {
+                Some(Handle { index, generation: slot.generation, slot_type: PhantomData })
+            }
+            SlotState::Vacant { .. } => None,
+        }
+    }
+
+    /// Every occupied slot, in ascending index order.
+    ///
+    /// Dense index order, so iteration is deterministic and may influence state or emitted
+    /// events — unlike a hash container, which rule 3 bans for exactly that reason.
+    pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            let index = u32::try_from(index).ok()?;
+            match &slot.state {
+                SlotState::Occupied(value) => Some((
+                    Handle { index, generation: slot.generation, slot_type: PhantomData },
+                    value,
+                )),
+                SlotState::Vacant { .. } => None,
+            }
+        })
+    }
+
     fn resolve(&self, handle: Handle<T>) -> Option<&SlotState<T>> {
         let slot = self.slots.get(handle.index as usize)?;
         (slot.generation == handle.generation).then_some(&slot.state)

@@ -15,18 +15,28 @@
 //! [`Config`]: config::Config
 //! [`Event::SubmitIntent`]: event::Event::SubmitIntent
 
+pub mod account;
 pub mod clock;
 pub mod command;
 pub mod config;
 pub mod engine;
 pub mod event;
+pub mod ledger;
+pub mod quote;
+pub mod request;
+pub mod reservation;
 pub mod slab;
 pub mod types;
 
+pub use account::{AccountIdx, MirroredBalance};
 pub use clock::{Clock, TestClock};
 pub use command::Command;
 pub use config::{Config, ConfigError, MAX_LEGS, MAX_QUOTES_PER_LEG};
 pub use engine::Engine;
 pub use event::Event;
+pub use ledger::{InvariantViolation, Ledger, LedgerError, SlabKind};
+pub use quote::{Quote, QuoteIdx};
+pub use request::{ReqIdx, Request};
+pub use reservation::{ResIdx, ResOwner, Reservation};
 pub use slab::{Handle, Slab, SlabFull};
 pub use types::{Amount, Dur, Price, Size, Ts, UNIT};
