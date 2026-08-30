@@ -1,69 +1,107 @@
 //! The harness (SPEC §13.1, CLAUDE 8c).
 //!
 //! Two systems that cannot see each other still need something that can see both. The
-//! harness owns one engine and one custody instance, advances **both clocks
-//! independently**, and drives the wires between them: engine events to the settlement
-//! adapter, chain log to the indexer. It is the only place global conservation and claim
-//! coverage can be asserted (SPEC §2.2), because those assertions span both halves and no
-//! function inside either half can compute them.
+//! harness owns one engine and one custody instance, advances **both clocks independently**,
+//! and drives the wires between them: engine events to the settlement adapter, and custody
+//! balance changes back to the engine's mirror.
 //!
-//! Two constraints, and they are the reason this type exists rather than a pair of `pub`
-//! fields somewhere convenient:
+//! It is the only place global conservation and claim coverage can be asserted (§2.2),
+//! because those assertions span both halves and no function inside either half can compute
+//! them. That is why §15's table says "the harness" and not "core".
+//!
+//! Two constraints, and they are why this type exists rather than a pair of `pub` fields
+//! somewhere convenient:
 //!
 //! - **It is not a back door.** It may read both systems; no engine code path may. If a
-//!   production path ever needs something only the harness can see, that is a design error,
-//!   not a convenience.
+//!   production path ever needs something only the harness can see, that is a design error.
 //! - **It has no production counterpart.** In v2 its wiring is replaced by real transport
-//!   and its cross-system assertions become the reconciler (SPEC §12) — a monitoring
-//!   component that can *report* divergence, not an oracle of truth that prevents it.
-//!
-//! Stage S0 delivers the skeleton: both systems owned, both clocks advancing separately,
-//! and the cross-system assertion hooks present but empty. They are empty because there is
-//! nothing yet to assert — custody has no balances until S3 — and they are *present*
-//! because the alternative is discovering in S3 that conservation has nowhere to live.
+//!   and its cross-system assertions become the reconciler (§12) — a monitoring component
+//!   that can *report* divergence, not an oracle of truth that prevents it.
 
-use rfq_chain::custody::Custody;
-use rfq_core::clock::Clock;
+use rfq_chain::bundle::Bundle;
+use rfq_chain::custody::{Custody, CustodyError, SettleError, SettleReceipt};
+use rfq_chain::escrow::Escrow;
+use rfq_core::account::{AccountIdx, MirroredBalance};
+use rfq_core::clock::{Clock, SettableClock};
+use rfq_core::command::Command;
 use rfq_core::config::{Config, ConfigError};
-use rfq_core::engine::Engine;
-use rfq_core::types::Ts;
+use rfq_core::engine::{Engine, EngineError};
+use rfq_core::escrow::EscrowId;
+use rfq_core::event::EventBuffer;
+use rfq_core::types::{Amount, Ts};
 
-/// One engine, one custody, two clocks.
-///
-/// Generic over both clocks so that the divergence of SPEC §9.1 is expressible by type:
-/// a test builds `Harness<TestClock, TestClock>` and moves them apart, while a scenario
-/// binary can build one on monotonic clocks and get the same wiring.
-#[derive(Debug)]
+use crate::settlement;
+
+/// What a cross-system invariant looked like when it broke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossSystemViolation {
+    /// §15.5 — `Σ custody balances + Σ notional over Locked escrows != deposited − withdrawn`.
+    ///
+    /// A sum that fell means money was lost; one that rose means it was duplicated.
+    ConservationBroken,
+    /// §15.6 — `custody.balance(a) < core.reserved(a) + core.committed(a)`.
+    ///
+    /// The engine has promised capital custody does not hold, which is the failure the §9.3
+    /// timelock exists to prevent and the reason a maker cannot quote-and-run.
+    ClaimCoverageBroken(AccountIdx),
+    /// §15.7 — the engine's mirror disagrees with custody. Exact in v1; in v2 this becomes a
+    /// bounded-drift assertion whose bound is the §9.3 lag terms.
+    MirrorDisagrees(AccountIdx),
+    /// §15.8 — an escrow's two contributions do not sum to its notional.
+    EscrowContributionsWrong(EscrowId),
+}
+
+/// One engine, one custody, two clocks, and the wires between them.
 pub struct Harness<EC: Clock, CC: Clock> {
     engine: Engine,
     /// The **venue's** clock. Held here rather than inside the engine because
-    /// `apply(cmd, now)` samples time once at the call site (CLAUDE 2); the engine has no
-    /// clock to re-read.
+    /// `apply(cmd, now)` samples time once at the call site (CLAUDE 2).
     engine_clock: EC,
     /// Custody holds the **chain's** clock itself, and neither system can read the other's.
     custody: Custody<CC>,
+    events: EventBuffer,
+    /// Bundles the adapter has pulled off the event stream and not yet submitted.
+    pending: Vec<Bundle>,
+    /// Escrows formed so far, in the order settlement produced them.
+    escrows: Vec<EscrowId>,
+}
+
+impl<EC: Clock, CC: Clock + core::fmt::Debug> core::fmt::Debug for Harness<EC, CC> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Harness").field("custody", &self.custody).finish_non_exhaustive()
+    }
 }
 
 impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// Validate the configuration and construct both systems.
     ///
-    /// The two startup assertions of SPEC §5.2 and §9.3 are checked here, and this is the
-    /// natural place for the second of them: the four-term timelock inequality relates the
-    /// engine's `MAX_QUOTE_TTL` to custody's `WITHDRAWAL_DELAY`, so it is a statement about
-    /// the pair. Neither system alone can check it, for the same reason neither alone can
-    /// check conservation.
+    /// Both startup assertions are checked here, and this is the natural place for the
+    /// four-term timelock inequality: it relates the engine's `MAX_QUOTE_TTL` to custody's
+    /// `WITHDRAWAL_DELAY`, so it is a statement about the pair. Neither system alone can
+    /// check it, for the same reason neither alone can check conservation.
     ///
     /// # Errors
     ///
-    /// Any [`ConfigError`]. A venue whose timelock does not cover the maximum quote
-    /// lifetime plus mirror lag must not start.
+    /// Any [`ConfigError`].
     pub fn new(config: Config, engine_clock: EC, custody_clock: CC) -> Result<Self, ConfigError> {
         let engine = Engine::new(config)?;
-        let custody = Custody::new(custody_clock, config.withdrawal_delay);
-        Ok(Self { engine, engine_clock, custody })
+        let custody = Custody::new(
+            custody_clock,
+            config.withdrawal_delay,
+            config.max_accounts,
+            config.max_escrows,
+        );
+        Ok(Self {
+            engine,
+            engine_clock,
+            custody,
+            events: EventBuffer::with_capacity(64),
+            pending: Vec::new(),
+            escrows: Vec::new(),
+        })
     }
 
-    /// Venue time, sampled once — this is the `now` that would be passed to `apply`.
+    /// Venue time, sampled once — this is the `now` passed to `apply`.
     pub fn engine_now(&self) -> Ts {
         self.engine_clock.now()
     }
@@ -83,6 +121,21 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         self.custody.clock_mut()
     }
 
+    /// Move both clocks to the same instant.
+    ///
+    /// v1's normal case: custody is in-process and the two clocks happen to agree (§9.1).
+    /// Divergence is a thing a test *injects*, not a thing that drifts in — and a test that
+    /// moves one clock ten minutes without the other is not modelling lag, it is modelling a
+    /// venue whose halves disagree about the hour.
+    pub fn set_both_clocks(&mut self, now: Ts)
+    where
+        EC: SettableClock,
+        CC: SettableClock,
+    {
+        self.engine_clock.set_now(now);
+        self.custody.clock_mut().set_now(now);
+    }
+
     /// The engine, read-only.
     pub const fn engine(&self) -> &Engine {
         &self.engine
@@ -93,38 +146,354 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         &self.custody
     }
 
-    /// Every cross-system invariant, run after every command in tests and scenarios
-    /// (SPEC §15, invariants 5–8).
-    pub fn assert_cross_system_invariants(&self) {
-        self.assert_conservation();
-        self.assert_claim_coverage();
-        self.assert_mirror_agreement();
+    /// Custody, mutably — for a test to install `on_settle_entry` or move money.
+    pub const fn custody_mut(&mut self) -> &mut Custody<CC> {
+        &mut self.custody
     }
 
-    /// SPEC §15.5 — `Σ custody.free + Σ notional over Locked escrows == deposited − withdrawn`.
-    ///
-    /// Purely custody-side: `reserved` and `committed` are claims *against* `free`, not
-    /// partitions of it, and adding them here would double-count. Only `Locked` escrows are
-    /// counted — a `Settled` escrow has already paid out, and summing every escrow makes
-    /// the first payout read as newly created money (CLAUDE 41).
-    ///
-    /// Empty until S3, when custody acquires balances and escrows.
-    #[allow(clippy::unused_self)] // S3 fills this in; the hook exists so it has a home.
-    fn assert_conservation(&self) {}
+    /// Escrows formed so far, in settlement order.
+    #[must_use]
+    pub fn escrows(&self) -> &[EscrowId] {
+        &self.escrows
+    }
 
-    /// SPEC §15.6 — `∀ a: custody.free(a) ≥ reserved(a) + committed(a)`.
-    ///
-    /// A violation means the engine has promised capital custody does not hold, which is
-    /// exactly the failure the §9.3 withdrawal timelock exists to prevent.
-    ///
-    /// Empty until S3.
-    #[allow(clippy::unused_self)] // S3.
-    fn assert_claim_coverage(&self) {}
+    /// Bundles waiting to be submitted.
+    #[must_use]
+    pub fn pending_bundles(&self) -> &[Bundle] {
+        &self.pending
+    }
 
-    /// SPEC §15.7 — `mirror.free(a) == custody.free(a)` for all accounts; exact in v1,
-    /// bounded by the §9.3 lag terms in v2.
+    /// Put money into custody and tell the engine about it.
     ///
-    /// Empty until S3.
-    #[allow(clippy::unused_self)] // S3.
-    fn assert_mirror_agreement(&self) {}
+    /// Two steps, in the only order that is honest: custody is credited first, because it is
+    /// authoritative, and the engine learns through a command — the same path a chain event
+    /// takes through the indexer. The engine never computes a balance.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyError`] from custody, or [`EngineError`] from the mirror update.
+    pub fn deposit(
+        &mut self,
+        account: AccountIdx,
+        amount: Amount,
+    ) -> Result<(), HarnessError> {
+        self.custody.deposit(account, amount).map_err(HarnessError::Custody)?;
+        self.mirror(account)
+    }
+
+    /// Ask custody to release funds, and tell the engine that availability has dropped.
+    ///
+    /// The mirror moves immediately even though the balance does not: admission must stop
+    /// lending against this money now, and settlement must keep finding it until the
+    /// timelock expires (§9.1, §9.3).
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyError`], or [`EngineError`] from the mirror update.
+    pub fn request_withdrawal(
+        &mut self,
+        account: AccountIdx,
+        amount: Amount,
+    ) -> Result<Ts, HarnessError> {
+        let matures_at =
+            self.custody.request_withdrawal(account, amount).map_err(HarnessError::Custody)?;
+        self.mirror(account)?;
+        self.assert_cross_system_invariants();
+        Ok(matures_at)
+    }
+
+    /// Execute a matured withdrawal and tell the engine.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyError`], or [`EngineError`] from the mirror update.
+    pub fn execute_withdrawal(&mut self, account: AccountIdx) -> Result<Amount, HarnessError> {
+        let amount =
+            self.custody.execute_withdrawal(account).map_err(HarnessError::Custody)?;
+        self.mirror(account)?;
+        // The narrower set: a withdrawal can legitimately land on capital the engine has
+        // already committed to a basket in flight, and the exit is that basket's settlement
+        // failing (§2.4). Conservation, escrow contributions and mirror agreement hold
+        // regardless, and the caller checks coverage where it is entitled to.
+        self.assert_settlement_invariants();
+        Ok(amount)
+    }
+
+    /// Apply one command to the engine, pump the wires, and assert every cross-system
+    /// invariant.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Engine`] if the engine refused. The wires are still pumped and the
+    /// invariants still asserted, because a rejection normalises and a rejected command must
+    /// leave the two systems as consistent as an accepted one.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke. That is a money-state error, and continuing past
+    /// one is how a venue loses track of who owns what.
+    pub fn apply(&mut self, command: Command) -> Result<(), HarnessError> {
+        // Sampled once, here, at the call site (CLAUDE 2).
+        let now = self.engine_clock.now();
+        self.events.clear();
+        let outcome = self.engine.apply(command, now, &mut self.events);
+
+        // The engine → custody wire: the adapter picks `SubmitIntent` off the stream and
+        // turns it into a bundle. Nothing else crosses.
+        for event in self.events.drain() {
+            if let Some(bundle) = settlement::bundle_from(&event) {
+                self.pending.push(bundle);
+            }
+        }
+
+        self.assert_cross_system_invariants();
+        outcome.map_err(HarnessError::Engine)
+    }
+
+    /// Submit every bundle the adapter has picked up, in order.
+    ///
+    /// Returns each bundle's outcome. A revert is not an error of the harness: it is the
+    /// answer, and the basket aborts safely.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke.
+    pub fn submit_pending(&mut self) -> Vec<Result<SettleReceipt, SettleError>> {
+        let bundles: Vec<Bundle> = self.pending.drain(..).collect();
+        let mut outcomes = Vec::with_capacity(bundles.len());
+        for bundle in bundles {
+            let outcome = self.custody.settle(&bundle);
+            if let Ok(receipt) = &outcome {
+                for id in receipt.escrows.iter().take(usize::from(receipt.n_escrows)) {
+                    self.escrows.push(*id);
+                }
+            }
+            outcomes.push(outcome);
+            self.mirror_all();
+            self.assert_settlement_invariants();
+        }
+        outcomes
+    }
+
+    /// Bring the engine's mirror of one account back in line with custody.
+    ///
+    /// This is the custody → engine wire in its simplest form: a balance change becomes a
+    /// `CreditAccount` command. S6 puts a real indexer in the middle — cursor, confirmation
+    /// depth, dedup — and that is where the mirror stops being exact and starts being
+    /// lagged (§2.3, §12).
+    fn mirror(&mut self, account: AccountIdx) -> Result<(), HarnessError> {
+        // Availability, not balance: this is the number admission is entitled to lend
+        // against (§9.1).
+        let free = self.custody.ledger().available(account);
+        let now = self.engine_clock.now();
+        self.events.clear();
+        self.engine
+            .apply(Command::CreditAccount { account, free }, now, &mut self.events)
+            .map_err(HarnessError::Engine)
+    }
+
+    fn mirror_all(&mut self) {
+        for index in 0..self.custody.ledger().account_count() {
+            let _ = self.mirror(AccountIdx(index));
+        }
+    }
+
+    /// Every cross-system invariant, run after every command in tests and scenarios
+    /// (SPEC §15, invariants 5–8).
+    ///
+    /// # Panics
+    ///
+    /// On the first violation, naming it.
+    pub fn assert_cross_system_invariants(&self) {
+        if let Err(violation) = self.check_cross_system_invariants() {
+            panic!("cross-system invariant violated (SPEC §15): {violation:?}");
+        }
+    }
+
+    /// The invariants that hold at **every** instant, including inside a settlement whose
+    /// outcome the engine has not yet been told.
+    ///
+    /// Claim coverage is not among them, and the omission is specific rather than
+    /// convenient. Coverage says the engine has not promised capital custody does not hold.
+    /// Between custody reverting a settlement and the engine learning it reverted, the
+    /// engine still shows that basket's capital as `committed` while custody has paid some
+    /// of it out to a withdrawal — a true violation with a defined exit, and the exit is
+    /// `PollSettlement` releasing the committed claims back to `free` (§2.4). Asserting
+    /// coverage there would be asserting the absence of a window the design describes.
+    ///
+    /// # Panics
+    ///
+    /// On the first violation, naming it.
+    pub fn assert_settlement_invariants(&self) {
+        let outcome = self
+            .check_conservation()
+            .and_then(|()| self.check_escrow_contributions())
+            .and_then(|()| self.check_mirror_agreement());
+        if let Err(violation) = outcome {
+            panic!("cross-system invariant violated (SPEC §15): {violation:?}");
+        }
+    }
+
+    /// The same checks, returned rather than panicked, so a test can name the violation.
+    ///
+    /// # Errors
+    ///
+    /// The first [`CrossSystemViolation`] found.
+    pub fn check_cross_system_invariants(&self) -> Result<(), CrossSystemViolation> {
+        self.check_conservation()?;
+        self.check_escrow_contributions()?;
+        self.check_claim_coverage()?;
+        self.check_mirror_agreement()
+    }
+
+    /// §15.5 alone, for a test asserting conservation across a payout that legitimately
+    /// leaves a core-side claim unbacked until the engine learns of it.
+    ///
+    /// # Errors
+    ///
+    /// [`CrossSystemViolation::ConservationBroken`].
+    pub fn check_conservation_for_test(&self) -> Result<(), CrossSystemViolation> {
+        self.check_conservation()
+    }
+
+    /// §15.5 — `Σ custody balances + Σ notional over Locked escrows == deposited − withdrawn`.
+    ///
+    /// Purely custody-side. `reserved` and `committed` are claims *against* `free`, not
+    /// partitions of it, and adding them here would double-count. **Only `Locked` escrows
+    /// are counted**: a `Settled` escrow has already paid out and its notional is back in
+    /// someone's balance, so summing every escrow would make the first payout read as newly
+    /// created money and the invariant would fail on a correct system (CLAUDE 41).
+    fn check_conservation(&self) -> Result<(), CrossSystemViolation> {
+        let ledger = self.custody.ledger();
+        let mut held = Amount::ZERO;
+        for index in 0..ledger.account_count() {
+            held = held
+                .checked_add(ledger.balance(AccountIdx(index)))
+                .ok_or(CrossSystemViolation::ConservationBroken)?;
+        }
+        for (_, escrow) in ledger.escrows() {
+            if escrow.is_locked() {
+                held = held
+                    .checked_add(escrow.notional())
+                    .ok_or(CrossSystemViolation::ConservationBroken)?;
+            }
+        }
+        let expected = ledger
+            .deposited()
+            .checked_sub(ledger.withdrawn())
+            .ok_or(CrossSystemViolation::ConservationBroken)?;
+        if held != expected {
+            return Err(CrossSystemViolation::ConservationBroken);
+        }
+        Ok(())
+    }
+
+    /// §15.8 — each escrow's two contributions sum to its notional, and are stored
+    /// separately. Separately matters because the void path returns each side its own
+    /// contribution (§10.3).
+    fn check_escrow_contributions(&self) -> Result<(), CrossSystemViolation> {
+        for (id, escrow) in self.custody.ledger().escrows() {
+            let sum = escrow
+                .requester_contribution()
+                .checked_add(escrow.maker_contribution())
+                .ok_or(CrossSystemViolation::EscrowContributionsWrong(id))?;
+            let notional = escrow
+                .size()
+                .notional()
+                .ok_or(CrossSystemViolation::EscrowContributionsWrong(id))?;
+            if sum != notional {
+                return Err(CrossSystemViolation::EscrowContributionsWrong(id));
+            }
+        }
+        Ok(())
+    }
+
+    /// §15.6 — every core-side claim is backed by capital custody holds **for that account**:
+    ///
+    /// ```text
+    /// ∀ a:  custody.balance(a) + Σ a's contributions in Locked escrows
+    ///           ≥  core.reserved(a) + core.committed(a)
+    /// ```
+    ///
+    /// §2.2 writes this as `custody.free(a) ≥ reserved(a) + committed(a)`, which is the same
+    /// statement before any settlement confirms — escrowed contributions are zero then, and
+    /// the two forms coincide exactly where §2.2 states it.
+    ///
+    /// The escrow term is not a weakening. Once a bundle settles, custody has moved the
+    /// requester's and each maker's contribution out of their balances and into escrow, while
+    /// the engine still shows that capital as `committed` until it learns the settlement
+    /// confirmed. The claim is backed throughout — by escrowed money rather than free money —
+    /// and the narrower form would fail on a correct system during that window, which is
+    /// precisely the situation CLAUDE 41 says not to create: an invariant that fails on a
+    /// correct system invites being weakened, and weakening it later to accommodate the
+    /// window is worse than stating it correctly now.
+    ///
+    /// Against **balance**, not availability. A maker may request a withdrawal covering
+    /// capital the engine has claimed — custody has no concept of a reservation (§1), and
+    /// the §9.3 timelock is what makes that safe. Asserting against availability would fail
+    /// the instant anyone requested a withdrawal, again on a correct system.
+    fn check_claim_coverage(&self) -> Result<(), CrossSystemViolation> {
+        let ledger = self.custody.ledger();
+        for index in 0..ledger.account_count() {
+            let account = AccountIdx(index);
+            let Some(entry) = self.engine.ledger().account(account) else { continue };
+            let claimed = entry
+                .reserved()
+                .checked_add(entry.committed())
+                .ok_or(CrossSystemViolation::ClaimCoverageBroken(account))?;
+            let mut backing = ledger.balance(account);
+            for (_, escrow) in ledger.escrows() {
+                if !escrow.is_locked() {
+                    continue;
+                }
+                if escrow.requester() == account {
+                    backing = backing
+                        .checked_add(escrow.requester_contribution())
+                        .ok_or(CrossSystemViolation::ClaimCoverageBroken(account))?;
+                }
+                if escrow.maker() == account {
+                    backing = backing
+                        .checked_add(escrow.maker_contribution())
+                        .ok_or(CrossSystemViolation::ClaimCoverageBroken(account))?;
+                }
+            }
+            if claimed > backing {
+                return Err(CrossSystemViolation::ClaimCoverageBroken(account));
+            }
+        }
+        Ok(())
+    }
+
+    /// §15.7 — the engine's mirror equals custody, exactly, in v1.
+    ///
+    /// The mirror projects **availability**, not balance. Admission is forward-looking and
+    /// must never lend against money already on its way out (§9.1), so the number the engine
+    /// admits against is `balance − pending withdrawals`. Settlement asks the other question
+    /// and reads the balance directly; the two are different numbers on purpose, and the
+    /// mirror is the one admission uses.
+    fn check_mirror_agreement(&self) -> Result<(), CrossSystemViolation> {
+        let ledger = self.custody.ledger();
+        for index in 0..ledger.account_count() {
+            let account = AccountIdx(index);
+            let Some(entry) = self.engine.ledger().account(account) else { continue };
+            if MirroredBalance::free(entry) != ledger.available(account) {
+                return Err(CrossSystemViolation::MirrorDisagrees(account));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every escrow custody holds, for a scenario trace.
+    pub fn locked_escrows(&self) -> impl Iterator<Item = (EscrowId, &Escrow)> {
+        self.custody.ledger().escrows().filter(|(_, escrow)| escrow.is_locked())
+    }
+}
+
+/// A harness operation that one of the two systems refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarnessError {
+    /// The engine refused a command.
+    Engine(EngineError),
+    /// Custody refused a balance operation.
+    Custody(CustodyError),
 }

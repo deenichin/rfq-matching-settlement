@@ -23,6 +23,16 @@ pub trait Clock {
     fn now(&self) -> Ts;
 }
 
+/// A clock whose reading can be set.
+///
+/// Separate from [`Clock`] so that "this clock can be moved" is a capability a caller must
+/// ask for: a custody built on `MonotonicClock` implements `Clock` and not this, so nothing
+/// can move chain time in production.
+pub trait SettableClock: Clock {
+    /// Move the clock to `now`.
+    fn set_now(&mut self, now: Ts);
+}
+
 /// A clock the test moves by hand.
 ///
 /// Every time-dependent test advances this instead of sleeping (CLAUDE 27, 43). It reads
@@ -64,6 +74,12 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&self) -> Ts {
         self.now
+    }
+}
+
+impl SettableClock for TestClock {
+    fn set_now(&mut self, now: Ts) {
+        self.set(now);
     }
 }
 

@@ -116,3 +116,134 @@ fn nothing_depends_on_the_scenario_runner() {
         "The scenario runner is a leaf binary.",
     );
 }
+
+
+// ─────────────────── the separation check (SPEC §13.1, PLAN S3) ───────────────────
+
+/// Every `.rs` file under a crate's `src`, as (path, contents).
+fn sources(crate_dir: &str) -> Vec<(PathBuf, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push((path, text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&workspace_root().join("crates").join(crate_dir).join("src"), &mut out);
+    assert!(!out.is_empty(), "no sources found for crates/{crate_dir}");
+    out
+}
+
+/// The code, with comments and string literals blanked out.
+///
+/// Prose is where the seam is *explained*: `core`'s clock module says why custody holds its
+/// own clock, and custody's module says what it is not allowed to know. Documentation naming
+/// the other system is the design being written down, not the design being violated — so the
+/// scan reads what compiles, not what is written about it.
+fn code_only(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut chars = line.char_indices().peekable();
+        while let Some((at, ch)) = chars.next() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '/' if chars.peek().is_some_and(|(_, next)| *next == '/') => {
+                    let _ = at;
+                    break;
+                }
+                _ => out.push(ch),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether `needle` appears as a whole identifier, not as part of a longer one.
+fn mentions(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at.saturating_add(needle.len())..].chars().next();
+        let boundary = |ch: Option<char>| {
+            ch.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        };
+        boundary(before) && boundary(after)
+    })
+}
+
+#[test]
+fn no_path_in_the_engine_can_read_a_custody_balance() {
+    // The compile-time half is rfq-core's build script: the engine declares no dependency,
+    // so nothing in `chain` is nameable from it. This is the readable half — it says which
+    // *concepts* are absent, and it fails on the first line of code that reaches for one.
+    for (path, text) in sources("core") {
+        let text = code_only(&text);
+        for forbidden in ["Custody", "CustodyLedger", "Bundle", "BundleLeg", "rfq_chain"] {
+            assert!(
+                !mentions(&text, forbidden),
+                "{} names `{forbidden}`. The engine holds an EscrowId and its own mirror, \
+                 and nothing else crosses (SPEC §13.1).",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn custody_has_never_heard_of_a_request_a_quote_or_a_claim() {
+    // The other direction, and the one cargo does not constrain at all: `chain` depends on
+    // `core`, so every engine type is nameable from it. What stops custody using them is
+    // this.
+    for (path, text) in sources("chain") {
+        let text = code_only(&text);
+        for forbidden in
+            ["Engine", "Ledger", "Reservation", "ResIdx", "ResOwner", "QuoteIdx", "Request"]
+        {
+            assert!(
+                !mentions(&text, forbidden),
+                "{} names `{forbidden}`. Custody knows nothing of requests, quotes, legs, \
+                 reservations or claims, and has never heard of a committed bucket \
+                 (SPEC §13.1).",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_harness_is_the_only_structure_that_holds_both() {
+    // It may read both systems; no production path may. If anything else in the runtime
+    // ever names both an Engine and a Custody, the seam has a second crossing point and the
+    // conservation assertions are no longer the only thing that spans it.
+    for (path, text) in sources("runtime") {
+        let text = code_only(&text);
+        let holds_engine = mentions(&text, "Engine");
+        let holds_custody = mentions(&text, "Custody");
+        if holds_engine && holds_custody {
+            assert!(
+                path.ends_with("harness.rs"),
+                "{} holds both systems. Only the harness may (SPEC §13.1, CLAUDE 8c).",
+                path.display()
+            );
+        }
+    }
+}

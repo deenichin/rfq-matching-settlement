@@ -70,6 +70,8 @@ pub struct Config {
     pub max_requests: u32,
     /// Quote-slab capacity.
     pub max_quotes: u32,
+    /// Escrows custody preallocates for. One per filled leg, and they are never freed.
+    pub max_escrows: u32,
     /// Contract indices the table is preallocated for. Contracts are never freed, so this
     /// is a hard ceiling on how many distinct descriptions the venue can ever trade (§5.3).
     pub max_contracts: u32,
@@ -130,6 +132,7 @@ impl Config {
             self.max_requests,
             self.max_quotes,
             self.max_contracts,
+            self.max_escrows,
         ];
         if capacities.contains(&u32::MAX) {
             return Err(ConfigError::CapacityTooLarge);
@@ -208,6 +211,7 @@ impl Default for Config {
             max_requests: 1_024,
             max_quotes: 4_096,
             max_contracts: 1_024,
+            max_escrows: 4_096,
         }
     }
 }
