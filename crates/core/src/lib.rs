@@ -35,7 +35,7 @@ pub mod types;
 pub use account::{AccountIdx, MirroredBalance};
 pub use clock::{Clock, SettableClock, TestClock};
 pub use command::{Command, ExpectedFill, LegSpec};
-pub use contract::{Contract, ContractIdx};
+pub use contract::{Contract, ContractIdx, ContractState, NotYet, OracleStatus, Outcome};
 pub use config::{Config, ConfigError, MAX_LEGS, MAX_QUOTES_PER_LEG};
 pub use engine::Engine;
 pub use escrow::EscrowId;

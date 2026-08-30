@@ -21,7 +21,8 @@
 
 use crate::account::AccountIdx;
 use crate::config::MAX_LEGS;
-use crate::contract::ContractIdx;
+use crate::contract::{ContractIdx, OracleStatus};
+use crate::escrow::EscrowId;
 use crate::quote::QuoteIdx;
 use crate::request::ReqIdx;
 use crate::settlement::TxStatus;
@@ -117,6 +118,38 @@ pub enum Command {
     CancelQuote {
         /// The quote the maker wishes they had not written.
         quote: QuoteIdx,
+    },
+    /// The oracle adapter reports what it has seen about a contract (§10.1).
+    ///
+    /// Pushed into the same command queue as everything else: the engine has **no oracle
+    /// dependency and never polls**. Monotonic — `Silent → InProgress → Final(o)` — and
+    /// enforced, because a status that can regress lets a later, less-informed observation
+    /// overwrite an earlier, better-informed one.
+    ///
+    /// "Oracle adapter only" is designed and not enforced: §16 excludes signatures, so the
+    /// boundary is the gateway's.
+    ReportOracleStatus {
+        /// Which contract.
+        contract: ContractIdx,
+        /// What the oracle says.
+        status: OracleStatus,
+    },
+    /// Pay out one escrow, if the contract it rests on has an outcome (§10.2).
+    ///
+    /// **Anyone** may send it, and it is O(1). Resolution attaches to the contract while
+    /// settlement attaches to each escrow: one contract may back thousands, and
+    /// `ReportOracleStatus` writes one field and touches none of them. Fanning out would be
+    /// unbounded work in one critical section, and on chain would exceed the block gas limit,
+    /// making settlement impossible.
+    ///
+    /// The contract travels with the escrow because the engine holds an `EscrowId` and
+    /// nothing else about it (§13.1); custody checks the two agree, which is what stops an
+    /// escrow being settled under another contract's outcome.
+    SettleEscrow {
+        /// Which escrow.
+        escrow: EscrowId,
+        /// The contract it rests on.
+        contract: ContractIdx,
     },
     /// Report what a poller observed about a settling request's nonce (§8).
     ///

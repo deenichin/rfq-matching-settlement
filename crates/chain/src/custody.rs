@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 use rfq_core::account::AccountIdx;
 use rfq_core::clock::Clock;
+use rfq_core::contract::{ContractIdx, Outcome};
 use rfq_core::escrow::EscrowId;
 use rfq_core::request::Nonce;
 use rfq_core::settlement::TxStatus;
@@ -62,6 +63,10 @@ pub enum CustodyError {
     WithdrawalNotMatured,
     /// Checked arithmetic overflowed. A rejection, never a wrap (CLAUDE 14).
     AmountOverflow,
+    /// No escrow with that id.
+    UnknownEscrow,
+    /// The settlement intent named a contract this escrow does not rest on.
+    EscrowContractMismatch,
 }
 
 /// Why a settlement transaction reverted (SPEC §9.1).
@@ -69,10 +74,19 @@ pub enum CustodyError {
 /// A revert is wholesale: no leg settles, no balance moves, the nonce is not consumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettleError {
-    /// The nonce has already been consumed.
+    /// This nonce already has a final answer.
     ///
-    /// **A retry bouncing off its own nonce is evidence the original succeeded** (§8.1).
-    /// Reading this as "the settlement failed" is the duplication path.
+    /// **One cause, two readings**, and the reading is not in this variant — it is in the
+    /// [`TxStatus`] returned beside it. A retry that finds `Settled` is evidence the original
+    /// succeeded; one that finds `Reverted` is evidence the trade definitively did not
+    /// happen. Both are the same *cause*: the nonce is spent, so this submission does
+    /// nothing.
+    ///
+    /// The distinction is deliberately kept in the status rather than split across two error
+    /// variants, because the engine never sees a `SettleError`. It reads `TxStatus` through
+    /// `PollSettlement`, so putting the difference in the error would place it in the type
+    /// the engine cannot see and leave it out of the one it acts on. Reading this as "the
+    /// settlement failed" without consulting the status is the duplication path (§8.1).
     NonceReused,
     /// A leg's quote is expired **at custody's clock**. The engine may believe it live; the
     /// two clocks are separate and the chain's is the one that counts here (§9.1).
@@ -363,36 +377,47 @@ impl CustodyLedger {
         executed
     }
 
-    /// Pay an escrow out to `winner`, or refund both sides if `winner` is `None`.
+    /// Pay one escrow out under `outcome`.
     ///
-    /// Re-settlement is a no-op, so replay is harmless (§9.2). The consumed flag is set in
-    /// the same mutation as the credit.
-    ///
-    /// Present in S3 so conservation has a way back out of `Locked`; the outcome that
-    /// decides `winner` is S5's.
+    /// O(1) and idempotent. The consumed flag is set in the same mutation as the credit, so
+    /// a replayed settlement finds it already spent (§9.2).
     ///
     /// # Errors
     ///
-    /// [`CustodyError::UnknownAccount`] if the escrow id does not resolve.
+    /// [`CustodyError::UnknownEscrow`] if the id does not resolve;
+    /// [`CustodyError::EscrowContractMismatch`] if the intent names a different contract.
     pub fn settle_escrow(
         &mut self,
         id: EscrowId,
-        winner: Option<AccountIdx>,
+        contract: ContractIdx,
+        outcome: Outcome,
     ) -> Result<bool, CustodyError> {
-        let escrow = *self.escrows.get(id.0 as usize).ok_or(CustodyError::UnknownAccount)?;
+        let escrow = *self.escrows.get(id.0 as usize).ok_or(CustodyError::UnknownEscrow)?;
+        // The intent names both, and they must agree. The engine holds an EscrowId and
+        // nothing else about it, so this is the only place the pairing can be checked — and
+        // without it an escrow could be paid out under another contract's outcome, which is
+        // the contract-identity confusion of §11 arriving through the back door.
+        if escrow.contract() != contract {
+            return Err(CustodyError::EscrowContractMismatch);
+        }
         if !escrow.is_locked() {
+            // Re-settlement is a no-op, so replay is harmless (§9.2).
             return Ok(false);
         }
-        let credits: [(AccountIdx, Amount); 2] = match winner {
-            Some(winner) => [(winner, escrow.notional()), (winner, Amount::ZERO)],
-            // Void returns each side its own contribution, restoring the exact pre-trade
-            // allocation. Splitting the notional would move money between the parties
-            // (§10.3).
-            None => [
-                (escrow.requester(), escrow.requester_contribution()),
-                (escrow.maker(), escrow.maker_contribution()),
-            ],
-        };
+
+        // Payout maps through the leg's **side**, taken from the escrow record. There is no
+        // implicit buyer or seller: who wins on `Yes` is a property of the leg (§10.3).
+        let credits: [(AccountIdx, Amount); 2] =
+            match rfq_core::contract::payout_goes_to_requester(outcome, escrow.side()) {
+                Some(true) => [(escrow.requester(), escrow.notional()), (escrow.maker(), Amount::ZERO)],
+                Some(false) => [(escrow.maker(), escrow.notional()), (escrow.requester(), Amount::ZERO)],
+                // Void returns each side its own contribution, restoring the exact pre-trade
+                // allocation. Splitting the notional would move money between the parties.
+                None => [
+                    (escrow.requester(), escrow.requester_contribution()),
+                    (escrow.maker(), escrow.maker_contribution()),
+                ],
+            };
         for (account, amount) in credits {
             if let Some(entry) = self.balances.get_mut(account.0 as usize) {
                 entry.balance = Amount(entry.balance.0.saturating_add(amount.0));

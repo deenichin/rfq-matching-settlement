@@ -247,3 +247,51 @@ fn the_harness_is_the_only_structure_that_holds_both() {
         }
     }
 }
+
+
+#[test]
+fn no_production_path_in_the_runtime_can_reach_the_harness() {
+    // The harness has **no production counterpart** (SPEC §13.1). In v2 its wiring is
+    // replaced by real transport and its cross-system assertions become the reconciler — a
+    // monitoring component that reports divergence rather than an oracle of truth that
+    // prevents it. So the single-writer loop, the event ring, the gateway and the settlement
+    // adapter must all be reachable without it, and none of them may name it.
+    //
+    // Which also settles where the test-only affordances live: `mirror_stale_for_test` is on
+    // the harness, and nothing but a test or a scenario can hold a harness to call it.
+    for (path, text) in sources("runtime") {
+        if path.ends_with("harness.rs") || path.ends_with("lib.rs") {
+            continue;
+        }
+        assert!(
+            !mentions(&code_only(&text), "Harness"),
+            "{} names the harness. It is a test-and-scenario structure and no production \
+             path may reach it (SPEC §13.1, CLAUDE 8c).",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn nothing_outside_a_test_names_a_test_only_affordance() {
+    // Named for what it is, so grep finds every caller. It must appear in `src` exactly
+    // once — at its definition, on the harness — and nowhere else. A second occurrence is a
+    // caller, and the only callers permitted are tests and scenarios.
+    let mut sites = Vec::new();
+    for crate_dir in ["core", "chain", "runtime", "scenarios"] {
+        for (path, text) in sources(crate_dir) {
+            if mentions(&code_only(&text), "mirror_stale_for_test") {
+                sites.push(path);
+            }
+        }
+    }
+    assert_eq!(
+        sites.len(),
+        1,
+        "a test-only affordance is named in production code at {sites:?}"
+    );
+    assert!(
+        sites[0].ends_with("harness.rs"),
+        "the definition moved off the harness, which is the only place it may live"
+    );
+}

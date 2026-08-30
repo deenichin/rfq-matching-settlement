@@ -20,6 +20,7 @@
 pub mod bundle;
 pub mod custody;
 pub mod escrow;
+pub mod oracle;
 
 pub use bundle::{Bundle, BundleLeg};
 pub use custody::{
@@ -27,3 +28,4 @@ pub use custody::{
     SettleReceipt, SubmitAck,
 };
 pub use escrow::{Escrow, EscrowState};
+pub use oracle::{Oracle, OracleError};

@@ -16,7 +16,7 @@ use rfq_core::account::AccountIdx;
 use rfq_core::clock::TestClock;
 use rfq_core::command::{Command, ExpectedFill, LegSpec};
 use rfq_core::config::{Config, MAX_LEGS};
-use rfq_core::contract::ContractIdx;
+use rfq_core::contract::{ContractIdx, Outcome};
 use rfq_core::request::{ReqIdx, RequestState};
 use rfq_core::types::{Amount, Dur, LegId, Price, Side, Size, Ts};
 use rfq_runtime::harness::{CrossSystemViolation, Harness, HarnessError};
@@ -109,7 +109,7 @@ fn requester_fill() -> Amount {
 /// to exactly the one contribution they will make.
 fn funded_harness() -> TestHarness {
     let mut harness =
-        Harness::new(config(), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
+        Harness::new(config(), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
     harness.deposit(REQUESTER, requester_reservation()).unwrap();
     harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
     harness.deposit(BETA, maker_contribution(FILL_B)).unwrap();
@@ -268,7 +268,7 @@ fn a_resubmitted_bundle_bounces_off_its_own_nonce() {
 fn market_with_a_requester_withdrawal_in_flight() -> (TestHarness, ReqIdx, Ts) {
     let config = laggy_config();
     let mut harness =
-        Harness::new(config, TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
+        Harness::new(config, TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
     harness.deposit(REQUESTER, requester_reservation()).unwrap();
     harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
     harness.deposit(BETA, maker_contribution(FILL_B)).unwrap();
@@ -647,14 +647,14 @@ fn a_venue_whose_timelock_does_not_cover_the_lag_terms_fails_to_start() {
     };
     assert_eq!(base.max_indexer_lag, Dur::ZERO);
     assert!(
-        Harness::new(base, TestClock::at(Ts(0)), TestClock::at(Ts(0))).is_ok(),
+        Harness::new(base, TestClock::at(Ts(0)), TestClock::at(Ts(0)), TestClock::at(Ts(0))).is_ok(),
         "the two-term form is satisfied, which is the precondition this test needs"
     );
 
     let violating = Config { max_indexer_lag: Dur(15_000), ..base };
     assert_ne!(violating.max_indexer_lag, Dur::ZERO, "the lag term under test must be non-zero");
     assert!(matches!(
-        Harness::new(violating, TestClock::at(Ts(0)), TestClock::at(Ts(0))),
+        Harness::new(violating, TestClock::at(Ts(0)), TestClock::at(Ts(0)), TestClock::at(Ts(0))),
         Err(rfq_core::config::ConfigError::WithdrawalDelayTooShort)
     ));
 
@@ -672,7 +672,7 @@ fn a_venue_whose_timelock_does_not_cover_the_lag_terms_fails_to_start() {
         Config { max_settlement_inclusion_time: Dur(11_000), ..base },
     ] {
         assert!(matches!(
-            Harness::new(candidate, TestClock::at(Ts(0)), TestClock::at(Ts(0))),
+            Harness::new(candidate, TestClock::at(Ts(0)), TestClock::at(Ts(0)), TestClock::at(Ts(0))),
             Err(rfq_core::config::ConfigError::WithdrawalDelayTooShort)
         ));
     }
@@ -700,7 +700,7 @@ fn conservation_counts_locked_escrows_only() {
     let first = harness.escrows()[0];
     let requester_before = harness.custody().ledger().balance(REQUESTER);
     let maker_before = harness.custody().ledger().balance(ALPHA);
-    assert!(harness.custody_mut().ledger_mut().settle_escrow(first, None).unwrap());
+    assert!(harness.custody_mut().ledger_mut().settle_escrow(first, SEPTEMBER, Outcome::Void).unwrap());
 
     assert_eq!(
         harness.custody().ledger().balance(REQUESTER),
@@ -718,7 +718,7 @@ fn conservation_counts_locked_escrows_only() {
     assert_eq!(harness.check_conservation_for_test(), Ok(()));
 
     // Re-settlement is a no-op, so replay is harmless (§9.2).
-    assert_eq!(harness.custody_mut().ledger_mut().settle_escrow(first, None), Ok(false));
+    assert_eq!(harness.custody_mut().ledger_mut().settle_escrow(first, SEPTEMBER, Outcome::Void), Ok(false));
     assert_eq!(harness.check_conservation_for_test(), Ok(()));
 }
 
@@ -766,7 +766,7 @@ fn a_settlement_debits_each_account_once_for_every_leg_it_wins() {
     // pass on a balance that covers either one alone, so the debits are accumulated per
     // account before any is checked.
     let mut harness =
-        Harness::new(config(), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
+        Harness::new(config(), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
     let two_legs = Amount(maker_contribution(FILL_A).0 + maker_contribution(FILL_B).0);
     harness.deposit(REQUESTER, requester_reservation()).unwrap();
     // Alpha is funded for exactly ONE of the two legs it is about to win.

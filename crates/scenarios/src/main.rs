@@ -24,7 +24,7 @@ fn main() {
     // two places CLAUDE 23 permits an unwrap; a venue that cannot validate its own policy
     // must fail loudly and immediately.
     #[allow(clippy::expect_used)]
-    let harness = Harness::new(config, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO))
+    let harness = Harness::new(config, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO))
         .expect("startup configuration must satisfy SPEC §5.2 and §9.3");
 
     println!("rfq scenario runner");

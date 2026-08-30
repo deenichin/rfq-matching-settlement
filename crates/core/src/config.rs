@@ -54,6 +54,13 @@ pub struct Config {
     /// How long after `event_date` a silent oracle must stay silent before the stall exit
     /// admits `Void` (SPEC §10.2). Long relative to any plausible honest delay.
     pub stall_grace: Dur,
+    /// How long an optimistic oracle's proposal may be contested before it can finalise.
+    /// The oracle's policy, not the venue's, and it never enters an engine predicate.
+    pub challenge_window: Dur,
+    /// The single designated id that may rule on a contested contract — the explicit, named
+    /// trust boundary of this design (SPEC §10.4). A single unbonded key that can assign any
+    /// outcome, including `Void`.
+    pub escalation_authority: crate::account::AccountIdx,
     /// Delay between `RequestWithdrawal` and execution (SPEC §9.3). The first term of the
     /// inequality below and the reason soft reservation is safe at all.
     pub withdrawal_delay: Dur,
@@ -214,6 +221,9 @@ impl Default for Config {
             max_settling_time: Dur(60_000),
             // 24h of oracle silence before the stall exit admits Void.
             stall_grace: Dur(86_400_000),
+            // 2h to contest a proposal.
+            challenge_window: Dur(7_200_000),
+            escalation_authority: crate::account::AccountIdx(0),
             // 10min, comfortably above the wider of the two claim windows:
             // max(30s, 5min + 1min) = 6min, plus three lag terms that are zero in v1.
             withdrawal_delay: Dur(600_000),

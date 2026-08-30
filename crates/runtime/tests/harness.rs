@@ -14,7 +14,7 @@ use rfq_runtime::clock::MonotonicClock;
 use rfq_runtime::harness::Harness;
 
 fn harness() -> Harness<TestClock, TestClock> {
-    Harness::new(Config::default(), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO)).unwrap()
+    Harness::new(Config::default(), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO)).unwrap()
 }
 
 #[test]
@@ -66,11 +66,11 @@ fn the_harness_refuses_to_start_on_a_configuration_that_fails_its_assertions() {
     };
     assert_ne!(violating.max_indexer_lag, Dur::ZERO, "the lag term under test must be non-zero");
 
-    let refused = Harness::new(violating, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
+    let refused = Harness::new(violating, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
     assert!(matches!(refused, Err(ConfigError::WithdrawalDelayTooShort)));
 
     let short_horizon = Config { min_horizon: Dur(1_000), ..Config::default() };
-    let refused = Harness::new(short_horizon, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
+    let refused = Harness::new(short_horizon, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
     assert!(matches!(refused, Err(ConfigError::HorizonTooShort)));
 }
 
@@ -78,7 +78,7 @@ fn the_harness_refuses_to_start_on_a_configuration_that_fails_its_assertions() {
 fn custody_holds_its_own_clock_instance() {
     // Not the same clock passed twice: custody was handed its own and reads it itself.
     let mut harness =
-        Harness::new(Config::default(), TestClock::at(Ts(100)), TestClock::at(Ts(7))).unwrap();
+        Harness::new(Config::default(), TestClock::at(Ts(100)), TestClock::at(Ts(7)), TestClock::at(Ts(7))).unwrap();
     assert_eq!(harness.engine_now(), Ts(100));
     assert_eq!(harness.custody_now(), Ts(7));
     assert_eq!(harness.custody().now(), Ts(7));

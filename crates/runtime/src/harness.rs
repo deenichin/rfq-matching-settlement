@@ -23,6 +23,7 @@ use rfq_chain::custody::{
     Custody, CustodyError, IncludedTx, SettleError, SettleReceipt, SubmitAck,
 };
 use rfq_chain::escrow::Escrow;
+use rfq_chain::oracle::Oracle;
 use rfq_core::account::{AccountIdx, MirroredBalance};
 use rfq_core::clock::{Clock, SettableClock};
 use rfq_core::command::Command;
@@ -31,6 +32,7 @@ use rfq_core::engine::{Engine, EngineError};
 use rfq_core::escrow::EscrowId;
 use rfq_core::event::{Event, EventBuffer};
 use rfq_core::request::ReqIdx;
+use rfq_core::contract::{ContractIdx, OracleStatus};
 use rfq_core::settlement::TxStatus;
 use rfq_core::types::{Amount, Ts};
 
@@ -68,6 +70,11 @@ pub struct Harness<EC: Clock, CC: Clock> {
     pending: Vec<Bundle>,
     /// Escrows formed so far, in the order settlement produced them.
     escrows: Vec<EscrowId>,
+    /// The oracle. In `chain`, like custody, and reaching the engine only as a status
+    /// carried in a command (§10.1, §13.1).
+    oracle: Oracle<CC>,
+    /// Settlement intents the adapter has picked up and not yet applied.
+    payouts: Vec<Event>,
     /// Whether balance changes are being withheld from the engine's mirror.
     indexer_stalled: bool,
     /// Bundles that have been sent and whose nonce has no terminal answer yet.
@@ -97,7 +104,12 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// # Errors
     ///
     /// Any [`ConfigError`].
-    pub fn new(config: Config, engine_clock: EC, custody_clock: CC) -> Result<Self, ConfigError> {
+    pub fn new(
+        config: Config,
+        engine_clock: EC,
+        custody_clock: CC,
+        oracle_clock: CC,
+    ) -> Result<Self, ConfigError> {
         let engine = Engine::new(config)?;
         let custody = Custody::new(
             custody_clock,
@@ -105,16 +117,22 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             config.max_accounts,
             config.max_escrows,
         );
+        // The oracle keeps a clock of its own too. It is a third external system, and giving
+        // it the venue's clock would be assuming the very agreement §9.1 says not to assume.
+        let oracle =
+            Oracle::new(oracle_clock, config.challenge_window, config.escalation_authority);
         Ok(Self {
             engine,
             engine_clock,
             custody,
             events: EventBuffer::with_capacity(64),
             pending: Vec::new(),
+            payouts: Vec::new(),
             escrows: Vec::new(),
             indexer_stalled: false,
             in_flight: Vec::new(),
             emitted: Vec::new(),
+            oracle,
         })
     }
 
@@ -262,6 +280,9 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             if let Some(bundle) = settlement::bundle_from(event) {
                 self.pending.push(bundle);
             }
+            if matches!(event, Event::SettleIntent { .. }) {
+                self.payouts.push(*event);
+            }
         }
         self.emitted.extend(emitted);
 
@@ -286,7 +307,9 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
 
     /// Send a settling request's bundle again.
     ///
-    /// Models the retry after a lost acknowledgement. The bundle is byte-identical and so is
+    /// Not a test affordance: this is what a settlement adapter does when an acknowledgement
+    /// is lost, and §8.1's whole answer depends on it existing. Models the retry after a lost
+    /// acknowledgement. The bundle is byte-identical and so is
     /// its nonce, which is the whole point: an idempotent nonce turns "unknown" from a
     /// catastrophe into a delay. Nothing is re-derived from engine state — the submitter
     /// resends what it sent.
@@ -309,6 +332,59 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             .find(|bundle| bundle.nonce == nonce)
             .ok_or(HarnessError::Engine(EngineError::RequestNotSettling))?;
         Ok(self.custody.submit(bundle))
+    }
+
+    /// The oracle, read-only.
+    pub const fn oracle(&self) -> &Oracle<CC> {
+        &self.oracle
+    }
+
+    /// The oracle, mutably — for a test to propose, contest, finalise or escalate.
+    pub const fn oracle_mut(&mut self) -> &mut Oracle<CC> {
+        &mut self.oracle
+    }
+
+    /// Read what the oracle says about a contract and hand it to the engine as a command.
+    ///
+    /// The oracle adapter, in one line: the engine has no oracle dependency and never polls,
+    /// so a status is read on one side and delivered as a command on the other (§10.1).
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Engine`] if the engine refused — a regression, most usefully.
+    pub fn report_oracle_status(
+        &mut self,
+        contract: ContractIdx,
+    ) -> Result<OracleStatus, HarnessError> {
+        let status = self.oracle.status(contract);
+        self.apply(Command::ReportOracleStatus { contract, status })?;
+        Ok(status)
+    }
+
+    /// Apply every settlement intent the adapter has picked up.
+    ///
+    /// The second engine-to-custody wire. Returns each escrow's outcome: `true` if it paid,
+    /// `false` if it had already been settled.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke.
+    pub fn apply_payouts(&mut self) -> Vec<Result<bool, CustodyError>> {
+        let intents: Vec<Event> = self.payouts.drain(..).collect();
+        let mut outcomes = Vec::with_capacity(intents.len());
+        for intent in intents {
+            let Event::SettleIntent { escrow, contract, outcome } = intent else { continue };
+            outcomes.push(self.custody.ledger_mut().settle_escrow(escrow, contract, outcome));
+        }
+        self.mirror_all();
+        self.assert_settlement_invariants();
+        outcomes
+    }
+
+    /// Settlement intents waiting to be applied.
+    #[must_use]
+    pub fn pending_payouts(&self) -> &[Event] {
+        &self.payouts
     }
 
     /// Everything the engine has emitted, in order.
@@ -420,7 +496,8 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         self.indexer_stalled = true;
     }
 
-    /// Write a stale value into the engine's mirror, as a lagging indexer would leave it.
+    /// **Test-only.** Write a stale value into the engine's mirror, as a lagging indexer
+    /// would leave it.
     ///
     /// Only meaningful while the indexer is stalled: it puts the engine's view where a real
     /// indexer's cursor would have left it, rather than requiring the test to have stalled

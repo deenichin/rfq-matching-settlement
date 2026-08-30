@@ -55,6 +55,15 @@ fn implemented_transitions() -> Vec<(StateName, StateName)> {
         (StateName("Quote::Active"), StateName("Quote::Released")), // outbid / replaced /
                                                                     // expired at accept /
                                                                     // request rejected
+        // Contract (§10.1). Two states, and the only edge is ReportOracleStatus{Final}.
+        (StateName("Contract::Unresolved"), StateName("Contract::Resolved")),
+        // Oracle status (§10.1), monotonic. Silent may go straight to Final — an oracle that
+        // reports a decision without ever announcing it was working is not regressing.
+        (StateName("Oracle::Silent"), StateName("Oracle::InProgress")),
+        (StateName("Oracle::Silent"), StateName("Oracle::Final")),
+        (StateName("Oracle::InProgress"), StateName("Oracle::Final")),
+        // Escrow (§9.2). SettleEscrow, once the contract has an outcome.
+        (StateName("Escrow::Locked"), StateName("Escrow::Settled")),
     ]
 }
 
@@ -69,6 +78,13 @@ fn states() -> Vec<(StateName, bool)> {
         (StateName("Quote::Active"), false),
         (StateName("Quote::Consumed"), true),
         (StateName("Quote::Released"), true),
+        (StateName("Contract::Unresolved"), false),
+        (StateName("Contract::Resolved"), true),
+        (StateName("Oracle::Silent"), false),
+        (StateName("Oracle::InProgress"), false),
+        (StateName("Oracle::Final"), true),
+        (StateName("Escrow::Locked"), false),
+        (StateName("Escrow::Settled"), true),
     ]
 }
 
@@ -132,12 +148,16 @@ fn the_two_declared_exceptions_of_spec_15_9_are_still_exactly_two() {
     ];
     assert_eq!(DECLARED_EXCEPTIONS.len(), 2);
 
-    // The first is a *policy*, not a hole in the graph: the transition exists and the engine
-    // declines to take it without a final answer.
+    // Neither is a hole in the graph: both transitions exist, and both are simply not taken
+    // while the answer they need is missing.
     let transitions = implemented_transitions();
     assert!(
         transitions.iter().any(|(from, _)| *from == StateName("Request::Settling")),
         "the first exception is about when the exit is taken, not whether it exists"
+    );
+    assert!(
+        transitions.iter().any(|(from, _)| *from == StateName("Escrow::Locked")),
+        "the second exception is likewise about when, not whether"
     );
 }
 

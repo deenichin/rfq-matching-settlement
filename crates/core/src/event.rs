@@ -14,7 +14,8 @@
 
 use crate::account::AccountIdx;
 use crate::config::MAX_LEGS;
-use crate::contract::ContractIdx;
+use crate::contract::{ContractIdx, Outcome};
+use crate::escrow::EscrowId;
 use crate::quote::QuoteIdx;
 use crate::request::{Nonce, ReqIdx};
 use crate::settlement::TxStatus;
@@ -125,6 +126,29 @@ pub enum Event {
         quote: QuoteIdx,
         /// Its maker.
         maker: AccountIdx,
+    },
+    /// A contract now has an outcome, and every escrow on it may be settled (§10.2).
+    ///
+    /// One field written, no escrows touched.
+    ContractResolved {
+        /// Which contract.
+        contract: ContractIdx,
+        /// What it resolved to.
+        outcome: Outcome,
+    },
+    /// Pay out one escrow. The second engine-to-custody path, and the same shape as the
+    /// first: an event an adapter carries, never a call (§13.1).
+    ///
+    /// Carries the contract as well as the escrow so custody can refuse to settle an escrow
+    /// under another contract's outcome — the engine holds an `EscrowId` and cannot check the
+    /// pairing itself.
+    SettleIntent {
+        /// Which escrow.
+        escrow: EscrowId,
+        /// The contract the engine derived the outcome from.
+        contract: ContractIdx,
+        /// The outcome to pay by.
+        outcome: Outcome,
     },
     /// The settlement confirmed: the request is `Escrowed` and custody holds the escrows.
     ///

@@ -94,7 +94,7 @@ fn requester_fill() -> Amount {
 /// twice overdraws somebody instead of being absorbed.
 fn accepted_market(config: Config) -> (TestHarness, ReqIdx) {
     let mut harness =
-        Harness::new(config, TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
+        Harness::new(config, TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
     harness.deposit(REQUESTER, requester_reservation()).unwrap();
     harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
     harness.deposit(BETA, maker_contribution(FILL_B)).unwrap();
@@ -268,6 +268,7 @@ fn a_reverted_nonce_fails_the_settlement_and_returns_every_claim_to_free() {
     // error.
     let mut harness = Harness::new(
         Config { max_requests: 4, ..laggy_config() },
+        TestClock::at(Ts(1_000)),
         TestClock::at(Ts(1_000)),
         TestClock::at(Ts(1_000)),
     )
@@ -552,6 +553,64 @@ fn a_retry_after_inclusion_reverts_on_its_own_nonce_and_that_is_not_a_failure() 
     assert_eq!(harness.custody().ledger().escrows().count(), escrows_after_first);
     assert!(committed_claims(&harness, request).is_empty());
     assert_eq!(harness.check_cross_system_invariants(), Ok(()));
+}
+
+#[test]
+fn a_retry_after_a_revert_finds_reverted_and_a_retry_after_a_settle_finds_settled() {
+    // `NonceReused` is one cause — the nonce is spent — with two readings, and the reading
+    // lives in the status beside it rather than in a second error variant. Both directions
+    // are asserted here, because "the status separates them" claimed in one direction only
+    // is half a claim.
+    let laggy = Config { max_requests: 4, ..laggy_config() };
+
+    // Direction one: the nonce settled. The retry reverts and the nonce says Settled.
+    let (mut harness, request) = accepted_market(laggy);
+    harness.submit_pending();
+    harness.include_all();
+    harness.resubmit(request).unwrap();
+    let retry = harness.include_all();
+    assert_eq!(retry[0].outcome, Err(SettleError::NonceReused));
+    assert_eq!(retry[0].status, TxStatus::Settled);
+
+    // Direction two: the nonce reverted. The retry reverts too, and the nonce says Reverted —
+    // a different fact about the trade, reached through an identical-looking error.
+    let mut harness = Harness::new(
+        Config { max_requests: 4, ..laggy_config() },
+        TestClock::at(Ts(1_000)),
+        TestClock::at(Ts(1_000)),
+        TestClock::at(Ts(1_000)),
+    )
+    .unwrap();
+    harness.deposit(REQUESTER, Amount(requester_contribution(LIMIT_A).0 * 2)).unwrap();
+    harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
+    for contract in [SEPTEMBER, OCTOBER] {
+        harness.apply(Command::RegisterContract { contract, event_date: EVENT_DATE }).unwrap();
+    }
+    let first = one_leg_request(&mut harness, SEPTEMBER, Ts(1_100));
+    harness.submit_pending();
+    harness.include_all();
+    harness.poll_settlement(first).unwrap();
+    harness.stall_indexer();
+    harness.mirror_stale_for_test(ALPHA, maker_contribution(FILL_A)).unwrap();
+    let second = one_leg_request(&mut harness, OCTOBER, Ts(1_200));
+    harness.submit_pending();
+    let included = harness.include_all();
+    assert_eq!(included[0].status, TxStatus::Reverted, "the precondition this needs");
+
+    harness.resubmit(second).unwrap();
+    let retry = harness.include_all();
+    assert_eq!(
+        retry[0].outcome,
+        Err(SettleError::NonceReused),
+        "the same error as a retry of a success"
+    );
+    assert_eq!(
+        retry[0].status,
+        TxStatus::Reverted,
+        "and a different answer, which is where the difference belongs"
+    );
+    // And the retry did not re-arm it: still no escrow for the second basket.
+    assert_eq!(harness.custody().ledger().escrows().count(), 1);
 }
 
 // ═══════════════════ (f) invariant 3 throughout Settling ═══════════════════

@@ -256,6 +256,17 @@ impl Ledger {
         self.contracts.get(contract.0 as usize).and_then(Option::as_ref)
     }
 
+    /// Record what the oracle says about a contract. Monotonicity is checked by the caller.
+    pub(crate) fn set_oracle_status(
+        &mut self,
+        contract: ContractIdx,
+        status: crate::contract::OracleStatus,
+    ) {
+        if let Some(Some(entry)) = self.contracts.get_mut(contract.0 as usize) {
+            entry.set_oracle_status(status);
+        }
+    }
+
     /// How many contract indices the table is preallocated for.
     #[must_use]
     pub fn contract_capacity(&self) -> u32 {

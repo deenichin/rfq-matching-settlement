@@ -15,6 +15,8 @@
 use crate::account::AccountIdx;
 use crate::command::{Command, ExpectedFill, LegSpec};
 use crate::config::{Config, ConfigError, MAX_LEGS};
+use crate::contract::{ContractIdx, OracleStatus};
+use crate::escrow::EscrowId;
 use crate::event::{Event, EventBuffer, EventBufferFull, IntentLeg, OpenLeg, QuoteRejectReason};
 use crate::ledger::{Ledger, LedgerError};
 use crate::quote::{Quote, QuoteIdx, QuoteState};
@@ -100,6 +102,15 @@ pub enum EngineError {
     /// A poll named a request that is not `Settling`. There is no nonce to report on, and a
     /// terminal request must not be moved again (§8.1's monotonicity, one level up).
     RequestNotSettling,
+    /// The oracle tried to walk its status backwards, or to overwrite a `Final` (§10.1).
+    ///
+    /// Load-bearing rather than hygiene: a retraction re-opens the stall exit that §10.4
+    /// closes, and an overwrite makes one contract pay identical positions opposite results
+    /// decided by settlement order — which no invariant in §15 can see.
+    OracleStatusRegression,
+    /// The contract has no outcome yet: the oracle has not spoken and the stall grace has
+    /// not elapsed (§10.2). Nothing moves, and the escrow stays locked.
+    OutcomeNotYet,
     /// A leg has no fill, so the whole basket aborts (§7.2).
     NoEligibleQuote {
         /// Which leg.
@@ -246,6 +257,12 @@ impl Engine {
             Command::PollSettlement { request, status } => {
                 self.poll_settlement(request, status, now, events)
             }
+            Command::ReportOracleStatus { contract, status } => {
+                self.report_oracle_status(contract, status, events)
+            }
+            Command::SettleEscrow { escrow, contract } => {
+                self.settle_escrow(escrow, contract, now, events)
+            }
         };
 
         // §15.3's state-coherence half is a whole-command property: a commit phase that
@@ -276,7 +293,9 @@ impl Engine {
         let mut touched: [Option<AccountIdx>; 2] = [None, None];
         match command {
             Command::CreditAccount { account, .. } => touched[0] = Some(account),
-            Command::RegisterContract { .. } => {}
+            Command::RegisterContract { .. }
+            | Command::ReportOracleStatus { .. }
+            | Command::SettleEscrow { .. } => {}
             Command::SubmitRequest { requester, .. } => touched[0] = Some(requester),
             Command::SubmitQuote { maker, request, .. } => {
                 touched[0] = Some(maker);
@@ -808,6 +827,56 @@ impl Engine {
         for handle in doomed.into_iter().flatten() {
             self.ledger.commit_phase().close_quote(handle);
         }
+    }
+
+    // ────────────────────────────── resolution (§10) ──────────────────────────────
+
+    /// Record what the oracle says, if it is an admissible successor.
+    fn report_oracle_status(
+        &mut self,
+        contract: ContractIdx,
+        status: OracleStatus,
+        events: &mut EventBuffer,
+    ) -> Result<(), EngineError> {
+        // ── PLAN / CHECK ──
+        let record = *self.ledger.contract(contract).ok_or(EngineError::UnknownContract)?;
+        if !record.may_report(status) {
+            return Err(EngineError::OracleStatusRegression);
+        }
+        let resolves = matches!(status, OracleStatus::Final(_));
+        events.headroom(usize::from(resolves))?;
+
+        // ── COMMIT ──
+        // One field. No escrows are touched: one contract may back thousands of them, and
+        // fanning out would be unbounded work in one critical section (§10.2).
+        self.ledger.set_oracle_status(contract, status);
+        if let OracleStatus::Final(outcome) = status {
+            events.push(Event::ContractResolved { contract, outcome });
+        }
+        Ok(())
+    }
+
+    /// Ask custody to pay out one escrow, if its contract has an outcome.
+    ///
+    /// O(1) and idempotent: a second command emits a second intent, and re-settlement is a
+    /// no-op at the custody layer, so replay is harmless (§9.2).
+    fn settle_escrow(
+        &mut self,
+        escrow: EscrowId,
+        contract: ContractIdx,
+        now: Ts,
+        events: &mut EventBuffer,
+    ) -> Result<(), EngineError> {
+        // ── PLAN / CHECK ──
+        let record = *self.ledger.contract(contract).ok_or(EngineError::UnknownContract)?;
+        let outcome = record
+            .outcome(now, self.config.stall_grace)
+            .map_err(|_| EngineError::OutcomeNotYet)?;
+        events.headroom(1)?;
+
+        // ── COMMIT ──
+        events.push(Event::SettleIntent { escrow, contract, outcome });
+        Ok(())
     }
 
     // ────────────────────────────── shared commit-phase helpers ──────────────────────────
