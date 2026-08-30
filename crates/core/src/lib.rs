@@ -28,6 +28,7 @@ pub mod quote;
 pub mod request;
 pub mod reservation;
 pub mod selection;
+pub mod settlement;
 pub mod slab;
 pub mod types;
 
@@ -43,6 +44,7 @@ pub use ledger::{CommitPhase, InvariantViolation, Ledger, LedgerError, SlabKind}
 pub use quote::{Quote, QuoteIdx, QuoteState};
 pub use request::{Leg, Nonce, ReqIdx, Request, RequestState, Selection};
 pub use selection::NoQuoteReason;
+pub use settlement::TxStatus;
 pub use reservation::{ResIdx, ResOwner, Reservation};
 pub use slab::{Handle, Slab, SlabFull};
 pub use types::{Amount, Dur, LegId, Price, Side, Size, Ts, UNIT};

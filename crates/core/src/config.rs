@@ -143,6 +143,9 @@ impl Config {
         // `event_date`. Without it, escrow can be created on a contract whose stall grace
         // has already elapsed — a trade that is immediately `Void`-resolvable, which is a
         // free capital round-trip against makers.
+        // Also the **requester's claim window**: their capital is claimed from
+        // `SubmitRequest` until settlement resolves, and §9.3's inequality takes a maximum
+        // over this and the maker's window.
         let latest_escrow_formation = self
             .max_request_ttl
             .checked_add(self.max_settling_time)
@@ -151,17 +154,32 @@ impl Config {
             return Err(ConfigError::HorizonTooShort);
         }
 
-        // SPEC §9.3, with every term named. Every term after the first is zero in v1, so
-        // this inequality cannot fail in this build — it is written out anyway because the
-        // shortfall is invisible exactly where it is cheapest to fix. On a real chain,
-        // omitting the lag terms lets a maker withdraw out from under a quote that was
-        // live when accepted, which is last look reintroduced through custody.
+        // SPEC §9.3, with every term named. The first is a **maximum over claim windows**,
+        // not a single duration, because the two sides bind for different lengths of time: a
+        // maker's capital is claimed for the life of a quote, a requester's from
+        // `SubmitRequest` until settlement resolves. Bounding only the quote side leaves a
+        // requester able to have their own withdrawal mature inside their own basket's
+        // settlement window — which fails safe, but is an unexplained asymmetry.
+        //
+        // Together the terms give the theorem: **no participant can withdraw out from under
+        // their own live claim.** Claim then withdraw — the claim dies at
+        // `T_claim + window` and the withdrawal lands at `T_w + DELAY` with `T_w >= T_claim`,
+        // and `DELAY > window`, so the claim is strictly dead first. Withdraw then claim —
+        // availability has already dropped, so only what the remainder covers is admitted,
+        // and that is exactly what survives execution.
+        let claim_window = if self.max_quote_ttl > latest_escrow_formation {
+            self.max_quote_ttl
+        } else {
+            latest_escrow_formation
+        };
+        // Every lag term after the claim window is zero in v1, so this inequality cannot
+        // fail in this build. The terms are written out anyway, because the shortfall is
+        // invisible exactly where it is cheapest to fix.
         let mirror_confirmation_lag = self
             .block_time
             .checked_mul(self.confirmations)
             .ok_or(ConfigError::TimelockTermOverflow)?;
-        let must_exceed = self
-            .max_quote_ttl
+        let must_exceed = claim_window
             .checked_add(mirror_confirmation_lag)
             .and_then(|sum| sum.checked_add(self.max_indexer_lag))
             .and_then(|sum| sum.checked_add(self.max_settlement_inclusion_time))
@@ -196,7 +214,8 @@ impl Default for Config {
             max_settling_time: Dur(60_000),
             // 24h of oracle silence before the stall exit admits Void.
             stall_grace: Dur(86_400_000),
-            // 10min, comfortably above max_quote_ttl + 0 + 0 + 0 = 30s.
+            // 10min, comfortably above the wider of the two claim windows:
+            // max(30s, 5min + 1min) = 6min, plus three lag terms that are zero in v1.
             withdrawal_delay: Dur(600_000),
             confirmations: 0,
             block_time: Dur::ZERO,

@@ -64,7 +64,15 @@ pub enum RequestState {
     Open,
     /// Accepted; a bundle carrying this nonce is in flight. Both sides' capital is
     /// `committed` and may not be released on a guess (§2.4, §8.3).
-    Settling(Nonce),
+    Settling {
+        /// The bundle's nonce. Its fate — not the fate of any one submission — is what
+        /// moves the request out of this state (§8.1).
+        nonce: Nonce,
+        /// When the timeout policy starts escalating. Reaching it releases **nothing**:
+        /// it raises an alert and polling continues, because stuck-but-consistent beats
+        /// fast-but-wrong when the alternative is losing money (§8.3).
+        deadline: Ts,
+    },
     /// Settlement confirmed; custody holds the escrows. Terminal. Reached in S4.
     Escrowed,
     /// The requester withdrew the request. Terminal.
@@ -78,6 +86,15 @@ impl RequestState {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Escrowed | Self::Rejected | Self::SettlementFailed)
+    }
+
+    /// The nonce in flight, if this request is settling.
+    #[must_use]
+    pub const fn nonce(self) -> Option<Nonce> {
+        match self {
+            Self::Settling { nonce, .. } => Some(nonce),
+            _ => None,
+        }
     }
 }
 

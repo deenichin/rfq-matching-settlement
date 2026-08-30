@@ -24,12 +24,13 @@
 //! that the money remains *present* for as long as a quote can bind, so presence is what
 //! settlement checks.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use rfq_core::account::AccountIdx;
 use rfq_core::clock::Clock;
 use rfq_core::escrow::EscrowId;
 use rfq_core::request::Nonce;
+use rfq_core::settlement::TxStatus;
 use rfq_core::types::{Amount, Dur, Ts};
 
 use crate::bundle::Bundle;
@@ -96,6 +97,24 @@ pub enum SettleError {
     AmountOverflow,
 }
 
+/// The acknowledgement that a bundle was sent. Says nothing about inclusion (§8.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmitAck {
+    /// The nonce the submission carried, so a retry can be recognised as the same one.
+    pub nonce: Nonce,
+}
+
+/// A submission the chain has included, and what came of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncludedTx {
+    /// The nonce carried.
+    pub nonce: Nonce,
+    /// What *this submission* did. A `NonceReused` revert here is not a failed trade.
+    pub outcome: Result<SettleReceipt, SettleError>,
+    /// What the **nonce** now says, which is what a poller reads and the engine acts on.
+    pub status: TxStatus,
+}
+
 /// What a settled transaction produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SettleReceipt {
@@ -153,7 +172,15 @@ pub struct CustodyLedger {
     balances: Vec<Balance>,
     escrows: Vec<Escrow>,
     max_escrows: usize,
-    nonces: BTreeSet<Nonce>,
+    /// The fate of every nonce that has reached a terminal answer.
+    ///
+    /// **Monotonic and terminal**: an entry here is never overwritten. `status` consults it
+    /// first, so a retry that bounces off an already-consumed nonce reverts *as a
+    /// submission* while the nonce keeps saying `Settled` (§8.1).
+    resolved: BTreeMap<Nonce, TxStatus>,
+    /// Submitted and not yet included. The test advances this queue explicitly; there is no
+    /// timer anywhere.
+    pending: Vec<Bundle>,
     withdrawal_delay: Dur,
     deposited: Amount,
     withdrawn: Amount,
@@ -209,14 +236,38 @@ impl CustodyLedger {
         })
     }
 
-    /// Whether this nonce has been consumed.
+    /// Whether this nonce has been consumed — that is, whether the trade it carried
+    /// actually happened.
     ///
-    /// Monotonic and terminal: once consumed, always consumed. A nonce that has been used
-    /// is a statement about the *nonce*, not about whichever submission most recently
-    /// carried it (§8.1).
+    /// A statement about the *nonce*, not about whichever submission most recently carried
+    /// it (§8.1).
     #[must_use]
     pub fn nonce_used(&self, nonce: Nonce) -> bool {
-        self.nonces.contains(&nonce)
+        matches!(self.resolved.get(&nonce), Some(TxStatus::Settled))
+    }
+
+    /// The fate of a nonce against final chain state (§8.1).
+    ///
+    /// Terminal answers win over anything in the queue. Submit a bundle whose nonce already
+    /// settled and this still reports `Settled`: the retry's own revert is not the nonce's
+    /// fate, and reporting it as one is how the engine ends up releasing capital for a
+    /// settlement that succeeded.
+    #[must_use]
+    pub fn status(&self, nonce: Nonce) -> TxStatus {
+        if let Some(status) = self.resolved.get(&nonce) {
+            return *status;
+        }
+        if self.pending.iter().any(|bundle| bundle.nonce == nonce) {
+            return TxStatus::Pending;
+        }
+        // No local answer exists. The node may never have received it (§8.1).
+        TxStatus::Unknown
+    }
+
+    /// Bundles submitted and not yet included.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// Credit an account. The only way money enters custody.
@@ -402,7 +453,8 @@ impl<C: Clock> Custody<C> {
                 balances,
                 escrows: Vec::with_capacity(max_escrows as usize),
                 max_escrows: max_escrows as usize,
-                nonces: BTreeSet::new(),
+                resolved: BTreeMap::new(),
+            pending: Vec::new(),
                 withdrawal_delay,
                 deposited: Amount::ZERO,
                 withdrawn: Amount::ZERO,
@@ -548,9 +600,84 @@ impl<C: Clock> Custody<C> {
                 *slot = id;
             }
         }
-        self.ledger.nonces.insert(bundle.nonce);
+        self.ledger.resolved.insert(bundle.nonce, TxStatus::Settled);
 
         Ok(SettleReceipt { escrows, n_escrows: bundle.n_legs })
+    }
+
+    /// Send a bundle. **"Sent" and nothing more** (§8.2).
+    ///
+    /// The acknowledgement says the transaction was handed over, not that it was included,
+    /// and certainly not that it applied. Between here and inclusion there is an interval in
+    /// which no local answer exists, which is the whole of §8.1.
+    pub fn submit(&mut self, bundle: Bundle) -> SubmitAck {
+        let nonce = bundle.nonce;
+        self.ledger.pending.push(bundle);
+        SubmitAck { nonce }
+    }
+
+    /// Include the oldest pending submission, applying it or reverting it.
+    ///
+    /// The test drives this explicitly: there is no timer, no thread and no sleep anywhere
+    /// in the chain mock, so every interleaving a test wants is reachable by construction.
+    ///
+    /// A submission whose nonce has **already reached a terminal answer** reverts with
+    /// `NonceReused` and leaves that answer untouched. That is the load-bearing case: the
+    /// retry genuinely did revert, and the nonce genuinely did settle, and only one of those
+    /// two facts is about the trade.
+    pub fn include_next(&mut self) -> Option<IncludedTx> {
+        if self.ledger.pending.is_empty() {
+            return None;
+        }
+        let bundle = self.ledger.pending.remove(0);
+        let nonce = bundle.nonce;
+
+        if let Some(existing) = self.ledger.resolved.get(&nonce).copied() {
+            // Monotonic and terminal. The submission reverts; the nonce does not change its
+            // mind (§8.1).
+            return Some(IncludedTx {
+                nonce,
+                outcome: Err(SettleError::NonceReused),
+                status: existing,
+            });
+        }
+
+        let outcome = self.settle(&bundle);
+        let status = match &outcome {
+            Ok(_) => TxStatus::Settled,
+            Err(_) => TxStatus::Reverted,
+        };
+        // `settle` records `Settled` itself; a revert is recorded here, and both are final.
+        self.ledger.resolved.entry(nonce).or_insert(status);
+        Some(IncludedTx { nonce, outcome, status: self.ledger.status(nonce) })
+    }
+
+    /// Include everything queued, oldest first.
+    pub fn include_all(&mut self) -> Vec<IncludedTx> {
+        let mut included = Vec::new();
+        while let Some(tx) = self.include_next() {
+            included.push(tx);
+        }
+        included
+    }
+
+    /// Discard the oldest pending submission without including it.
+    ///
+    /// Models the send that never arrived — the RPC that timed out, the process that died
+    /// mid-write. The nonce's status returns to `Unknown`, which is not an answer and must
+    /// never be treated as one (§8.3).
+    pub fn drop_next_submission(&mut self) -> bool {
+        if self.ledger.pending.is_empty() {
+            return false;
+        }
+        self.ledger.pending.remove(0);
+        true
+    }
+
+    /// The fate of a nonce, as the poller would read it.
+    #[must_use]
+    pub fn status(&self, nonce: Nonce) -> TxStatus {
+        self.ledger.status(nonce)
     }
 
     /// Every check of §9.1, in order, returning what each account would be debited.

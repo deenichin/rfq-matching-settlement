@@ -17,6 +17,7 @@ use crate::config::MAX_LEGS;
 use crate::contract::ContractIdx;
 use crate::quote::QuoteIdx;
 use crate::request::{Nonce, ReqIdx};
+use crate::settlement::TxStatus;
 use crate::types::{LegId, Price, Side, Size, Ts};
 
 /// One leg of a request, as broadcast to makers.
@@ -59,6 +60,10 @@ pub struct IntentLeg {
 pub enum QuoteRejectReason {
     /// A better quote won the leg at accept (§7.2).
     Outbid,
+    /// The settlement carrying this quote definitively failed, and its capital came back
+    /// (§8). The maker won its leg and still ends up unfilled, which is exactly the sort of
+    /// thing they must not have to infer from silence.
+    SettlementFailed,
     /// The maker replaced this quote with a better one of their own (§6).
     Replaced,
     /// The requester withdrew the request (§11).
@@ -120,6 +125,41 @@ pub enum Event {
         quote: QuoteIdx,
         /// Its maker.
         maker: AccountIdx,
+    },
+    /// The settlement confirmed: the request is `Escrowed` and custody holds the escrows.
+    ///
+    /// The committed capital has left the core's books — it is escrowed now, and escrows are
+    /// custody's (§2.4, §13.1).
+    RequestEscrowed {
+        /// Which request.
+        request: ReqIdx,
+        /// The nonce that settled.
+        nonce: Nonce,
+    },
+    /// The settlement definitively failed: the request is `SettlementFailed` and every
+    /// committed claim has gone back to `free`.
+    ///
+    /// Terminal, and the request cannot be re-accepted. Repeated insolvency is therefore a
+    /// denial vector against a requester, bounded by the §9.3 timelock and not otherwise
+    /// closed (§11).
+    RequestSettlementFailed {
+        /// Which request.
+        request: ReqIdx,
+        /// The nonce that reverted.
+        nonce: Nonce,
+    },
+    /// The settling deadline passed with the nonce still unresolved (§8.3).
+    ///
+    /// An operator alert, not a state change. Reservations are **not** released: releasing
+    /// on a guess is the duplication path, and stuck-but-consistent beats fast-but-wrong
+    /// when the alternative is losing money.
+    SettlementStalled {
+        /// Which request.
+        request: ReqIdx,
+        /// The nonce nobody can yet account for.
+        nonce: Nonce,
+        /// What the poller last observed — `Unknown` or `Pending`, never terminal.
+        status: TxStatus,
     },
     /// The one engine-to-custody path: a complete bundle and its nonce (§7.2, §13.1).
     ///

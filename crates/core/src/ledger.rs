@@ -975,6 +975,59 @@ impl CommitPhase<'_> {
         self.ledger.assert_invariants();
     }
 
+    /// Discharge every claim on a request's committed list, returning them to the accounts'
+    /// free capital and freeing their slots. Calls `visit` with each claim's owner and
+    /// amount as it goes.
+    ///
+    /// One operation for both settlement outcomes, and deliberately. From the engine's side
+    /// `committed → escrowed` and `committed → free` are the same bookkeeping: the claim
+    /// leaves the core's books. Which of the two happened is a fact about custody, recorded
+    /// in the request's state, not a different ledger move — and inventing a second one
+    /// would put the engine in the position of tracking escrows, which are custody's (§2.4,
+    /// §13.1).
+    ///
+    /// Precondition, established in CHECK: the request resolves and its status is final.
+    pub fn discharge_committed<F: FnMut(ResOwner, Amount)>(
+        &mut self,
+        request: ReqIdx,
+        mut visit: F,
+    ) {
+        let mut cursor =
+            self.ledger.requests.get(request).map_or(Link::NIL, |record| record.committed_head);
+        let mut steps: u32 = 0;
+        while let Some(index) = cursor.index() {
+            let Some(reservation) = self.ledger.reservation_at(index) else {
+                debug_assert!(false, "a committed list names a vacant slot");
+                break;
+            };
+            let account = reservation.account();
+            let amount = reservation.amount();
+            let owner = reservation.owner();
+            let next = reservation.neighbours().1;
+            let Some(handle) = self.ledger.reservations.handle_at(index) else { break };
+
+            if let Some(entry) = self.ledger.accounts.get_mut(account.0 as usize) {
+                let committed = Amount(entry.committed().0.saturating_sub(amount.0));
+                entry.set_committed(committed);
+            }
+            self.ledger.set_owner_claim(owner, None);
+            self.ledger.reservations.remove(handle);
+            visit(owner, amount);
+
+            cursor = next;
+            steps = steps.saturating_add(1);
+            if steps > self.ledger.reservations.capacity() {
+                debug_assert!(false, "a committed list is cyclic");
+                break;
+            }
+        }
+        if let Some(record) = self.ledger.requests.get_mut(request) {
+            record.committed_head = Link::NIL;
+            record.set_claim(None);
+        }
+        self.ledger.assert_invariants();
+    }
+
     /// A quote, mutably. Field writes only; nothing here can fail.
     pub fn quote_mut(&mut self, quote: QuoteIdx) -> Option<&mut Quote> {
         self.ledger.quote_mut(quote)

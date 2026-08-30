@@ -23,6 +23,7 @@ pub mod escrow;
 
 pub use bundle::{Bundle, BundleLeg};
 pub use custody::{
-    Balance, Custody, CustodyError, CustodyLedger, SettleEntryHook, SettleError, SettleReceipt,
+    Balance, Custody, CustodyError, CustodyLedger, IncludedTx, SettleEntryHook, SettleError,
+    SettleReceipt, SubmitAck,
 };
 pub use escrow::{Escrow, EscrowState};

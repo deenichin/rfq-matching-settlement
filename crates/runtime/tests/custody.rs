@@ -52,12 +52,25 @@ fn config() -> Config {
         max_legs: 4,
         max_quotes_per_leg: 4,
         max_quote_ttl: Dur(30_000),
-        // A request may stand far longer than a quote may bind. The §9.3 inequality relates
-        // WITHDRAWAL_DELAY to MAX_QUOTE_TTL and says nothing about MAX_REQUEST_TTL, which is
-        // what makes the withdrawal-in-flight case below reachable at all.
-        max_request_ttl: Dur(1_000_000),
-        min_horizon: Dur(2_000_000),
         ..Config::default()
+    }
+}
+
+/// The same venue, admitting a non-zero indexer lag — and widening the timelock to cover it,
+/// because §9.3's inequality includes the lag terms.
+///
+/// Needed because with every lag term at zero the theorem below holds absolutely: no
+/// participant can withdraw out from under their own live claim, so a withdrawal can never
+/// land inside a settlement window. Staleness is the only thing that reopens it, and a venue
+/// that wants to exhibit staleness has to admit it has some.
+fn laggy_config() -> Config {
+    let base = config();
+    let indexer_lag = Dur(400_000);
+    let claim_window = Dur(base.max_request_ttl.0 + base.max_settling_time.0);
+    Config {
+        max_indexer_lag: indexer_lag,
+        withdrawal_delay: Dur(claim_window.0 + indexer_lag.0 + 1),
+        ..base
     }
 }
 
@@ -177,7 +190,7 @@ fn a_bundle_whose_funds_are_all_present_settles() {
     );
     assert_eq!(harness.custody().ledger().escrows().count(), 0);
 
-    let outcomes = harness.submit_pending();
+    let outcomes = harness.settle_pending();
     assert_eq!(outcomes.len(), 1);
     let receipt = outcomes[0].expect("all funds are present");
     assert_eq!(receipt.n_escrows, 3, "one escrow per leg");
@@ -210,7 +223,7 @@ fn a_bundle_whose_funds_are_all_present_settles() {
     assert_eq!(escrows[2].side(), Side::Yes);
 
     // The nonce is consumed, and it is the request's.
-    let RequestState::Settling(nonce) =
+    let RequestState::Settling { nonce, .. } =
         harness.engine().ledger().request(request).unwrap().state()
     else {
         panic!("Settling");
@@ -228,7 +241,7 @@ fn a_resubmitted_bundle_bounces_off_its_own_nonce() {
     let mut harness = funded_harness();
     matched_market(&mut harness);
     let bundle = harness.pending_bundles()[0];
-    harness.submit_pending()[0].expect("first inclusion settles");
+    harness.settle_pending()[0].expect("first inclusion settles");
 
     let escrows_after_first = harness.custody().ledger().escrows().count();
     assert_eq!(harness.custody_mut().settle(&bundle), Err(SettleError::NonceReused));
@@ -242,30 +255,46 @@ fn a_resubmitted_bundle_bounces_off_its_own_nonce() {
 
 // ═════════════════ (b) a withdrawal executed before the accept ═════════════════
 
-/// Open the request first, then ask to withdraw, then quote and accept much later.
+/// A market in which the requester's withdrawal is due to land mid-settlement.
 ///
-/// The order matters and is the only order that reaches this state. A withdrawal executes
-/// `WITHDRAWAL_DELAY` after it is requested, and the §9.3 inequality makes that strictly
-/// longer than any quote can bind — so a *maker* can never have a live quote when their own
-/// withdrawal lands (see `a_maker_can_never_withdraw_out_from_under_a_live_quote`). A
-/// requester can: their request stands for `MAX_REQUEST_TTL`, which the inequality does not
-/// bound, so their withdrawal can mature while their own basket is still forming.
-fn market_with_a_requester_withdrawal(harness: &mut TestHarness) -> ReqIdx {
-    harness.apply(three_leg_request_with_deadline(Ts(700_000))).unwrap();
-    let request = harness.engine().ledger().requests().next().unwrap().0;
+/// Reaching this state needs a **stale mirror**, and nothing else will do. With every lag
+/// term at zero the §9.3 inequality makes it unreachable: a withdrawal executes
+/// `WITHDRAWAL_DELAY` after it is requested, and that is strictly longer than any claim can
+/// bind, so requesting one first drops availability before the claim is admitted and
+/// requesting one later lands after the claim is dead. A lagging indexer breaks the second
+/// half — the engine keeps admitting against a balance custody has already promised away.
+///
+/// Returns the market with one bundle accepted and the withdrawal maturing at `MATURES_AT`.
+fn market_with_a_requester_withdrawal_in_flight() -> (TestHarness, ReqIdx, Ts) {
+    let config = laggy_config();
+    let mut harness =
+        Harness::new(config, TestClock::at(Ts(1_000)), TestClock::at(Ts(1_000))).unwrap();
+    harness.deposit(REQUESTER, requester_reservation()).unwrap();
+    harness.deposit(ALPHA, maker_contribution(FILL_A)).unwrap();
+    harness.deposit(BETA, maker_contribution(FILL_B)).unwrap();
+    harness.deposit(GAMMA, maker_contribution(FILL_C)).unwrap();
+    for contract in [SEPTEMBER, OCTOBER, NOVEMBER] {
+        harness.apply(Command::RegisterContract { contract, event_date: EVENT_DATE }).unwrap();
+    }
 
-    // The requester asks for their money back. Availability drops at once — the engine will
-    // not lend against it again — while the balance stays present for the timelock's whole
-    // duration.
+    // The requester asks for their money back. Availability drops in custody at once; the
+    // balance stays present for the timelock's whole duration.
+    harness.stall_indexer();
     let matures_at = harness.request_withdrawal(REQUESTER, requester_reservation()).unwrap();
-    assert_eq!(matures_at, Ts(601_000));
     assert_eq!(harness.custody().ledger().available(REQUESTER), Amount::ZERO);
     assert_eq!(harness.custody().ledger().balance(REQUESTER), requester_reservation());
+    assert_eq!(
+        harness.engine().ledger().account(REQUESTER).unwrap().free(),
+        requester_reservation(),
+        "the engine has not heard, which is the only reason what follows is possible"
+    );
 
-    // Quotes arrive much later, close enough to the withdrawal's maturity to still be live
-    // when it lands. Both clocks move together: v1's custody is in-process and the two
-    // agree, and injecting divergence is (c2)'s job, not this one's.
-    harness.set_both_clocks(Ts(600_000));
+    // Much later — but still before maturity — the request is opened, quoted and accepted.
+    harness.set_both_clocks(Ts(500_000));
+    harness.apply(three_leg_request_with_deadline(Ts(780_000))).unwrap();
+    let request = harness.engine().ledger().requests().next().unwrap().0;
+
+    harness.set_both_clocks(Ts(760_000));
     for (maker, leg, price) in [(ALPHA, 0_u8, FILL_A), (BETA, 1, FILL_B), (GAMMA, 2, FILL_C)] {
         harness
             .apply(Command::SubmitQuote {
@@ -274,24 +303,24 @@ fn market_with_a_requester_withdrawal(harness: &mut TestHarness) -> ReqIdx {
                 leg: LegId(leg),
                 price,
                 size: SIZE,
-                expires_at: Ts(620_000),
+                expires_at: Ts(785_000),
             })
             .unwrap();
     }
-    harness.set_both_clocks(Ts(600_100));
+    harness.set_both_clocks(Ts(760_500));
     harness
         .apply(Command::AcceptRequest { request, expected: accept(), n_legs: 3 })
         .unwrap();
-    request
+    assert!(matures_at > harness.custody_now(), "the withdrawal has not landed yet");
+    (harness, request, matures_at)
 }
 
 #[test]
 fn a_withdrawal_executed_before_the_accept_is_caught_by_the_pre_check() {
-    let mut harness = funded_harness();
-    let _request = market_with_a_requester_withdrawal(&mut harness);
+    let (mut harness, _request, matures_at) = market_with_a_requester_withdrawal_in_flight();
 
     // The withdrawal matures and lands before anyone submits.
-    harness.set_both_clocks(Ts(601_000));
+    harness.set_both_clocks(matures_at);
     assert_eq!(harness.execute_withdrawal(REQUESTER).unwrap(), requester_reservation());
     assert_eq!(harness.custody().ledger().balance(REQUESTER), Amount::ZERO);
 
@@ -300,11 +329,11 @@ fn a_withdrawal_executed_before_the_accept_is_caught_by_the_pre_check() {
         harness.custody().precheck(&bundle),
         Err(SettleError::InsufficientFunds { account: REQUESTER })
     );
-    let outcomes = harness.submit_pending();
+    let outcomes = harness.settle_pending();
     assert_eq!(outcomes[0], Err(SettleError::InsufficientFunds { account: REQUESTER }));
 
-    // Nothing committed: no escrow, no maker debited, nonce unconsumed so a retry is still
-    // possible if the money comes back.
+    // Nothing committed: no escrow, no maker debited, nonce unconsumed so the basket can be
+    // retried if the money comes back.
     assert_eq!(harness.custody().ledger().escrows().count(), 0);
     assert_eq!(harness.custody().ledger().balance(ALPHA), maker_contribution(FILL_A));
     assert_eq!(harness.custody().ledger().balance(BETA), maker_contribution(FILL_B));
@@ -312,11 +341,9 @@ fn a_withdrawal_executed_before_the_accept_is_caught_by_the_pre_check() {
     assert!(!harness.custody().ledger().nonce_used(bundle.nonce));
 
     // Conservation, escrow contributions and mirror agreement all hold. Claim coverage does
-    // not, and that is the design rather than a defect: the requester's capital is still
-    // `committed` to a basket the engine has not yet learned reverted, while custody has
-    // paid it out. The exit is `PollSettlement` releasing those claims back to `free`
-    // (§2.4) — asserted here as the specific violation, so the window is named rather than
-    // skipped over.
+    // not, and that is the design: the requester's capital is still committed to a basket the
+    // engine has not yet learned reverted. `PollSettlement` on a `Reverted` nonce is the
+    // exit (§8, §15.6).
     harness.assert_settlement_invariants();
     assert_eq!(
         harness.check_cross_system_invariants(),
@@ -331,8 +358,7 @@ fn a_withdrawal_landing_between_the_pre_check_and_the_settle_reverts_the_whole_b
     // The pre-check is an optimisation with **no correctness role**. Checking then
     // submitting is TOCTOU: the window between check and inclusion is exactly where a
     // withdrawal lands, and the authoritative validation is inside the transaction (§8.2).
-    let mut harness = funded_harness();
-    let _request = market_with_a_requester_withdrawal(&mut harness);
+    let (mut harness, _request, matures_at) = market_with_a_requester_withdrawal_in_flight();
     let bundle = harness.pending_bundles()[0];
 
     // At this instant the withdrawal has not matured and the pre-check passes: the money is
@@ -340,22 +366,22 @@ fn a_withdrawal_landing_between_the_pre_check_and_the_settle_reverts_the_whole_b
     assert_eq!(harness.custody().precheck(&bundle), Ok(()));
     assert_eq!(harness.custody().ledger().balance(REQUESTER), requester_reservation());
 
-    // The clock reaches maturity, and the withdrawal lands *inside* the transaction —
-    // after entry, before validation.
-    harness.set_both_clocks(Ts(601_000));
+    // The clock reaches maturity, and the withdrawal lands *inside* the transaction — after
+    // entry, before validation.
+    harness.set_both_clocks(matures_at);
     harness.custody_mut().on_settle_entry(Box::new(|ledger, now| {
         ledger.execute_matured_withdrawals(now);
     }));
 
-    let outcomes = harness.submit_pending();
+    let outcomes = harness.settle_pending();
     assert_eq!(
         outcomes[0],
         Err(SettleError::InsufficientFunds { account: REQUESTER }),
         "settle must revalidate rather than trust the pre-check"
     );
 
-    // Wholesale revert: not one leg settled, not one maker debited, and the nonce is
-    // unconsumed. Multi-leg atomicity here is inherited from the transaction, not built.
+    // Wholesale revert: not one leg settled, not one maker debited, and the nonce unconsumed.
+    // Multi-leg atomicity here is inherited from the transaction, not built.
     assert_eq!(harness.custody().ledger().escrows().count(), 0);
     assert_eq!(harness.custody().ledger().balance(ALPHA), maker_contribution(FILL_A));
     assert_eq!(harness.custody().ledger().balance(BETA), maker_contribution(FILL_B));
@@ -370,38 +396,41 @@ fn a_withdrawal_landing_between_the_pre_check_and_the_settle_reverts_the_whole_b
 }
 
 #[test]
-fn a_maker_can_never_withdraw_out_from_under_a_live_quote() {
-    // The property §9.3 exists to guarantee, stated as the theorem it is rather than as a
-    // scenario. Two cases exhaust the orderings:
+fn no_participant_can_withdraw_out_from_under_their_own_live_claim() {
+    // The theorem §9.3's inequality produces, for **both** claim windows. A maker's capital
+    // is claimed for the life of a quote; a requester's from SubmitRequest until settlement
+    // resolves. The inequality takes a maximum over the two, so neither side can do it.
     //
-    //   quote first, then withdraw — the quote expires at `T_q + MAX_QUOTE_TTL` and the
-    //     withdrawal lands at `T_w + WITHDRAWAL_DELAY` with `T_w >= T_q`. Since the
-    //     inequality makes DELAY > TTL, the quote is strictly dead first.
-    //   withdraw first, then quote — availability has already dropped, so the engine only
-    //     admits a quote the *remaining* balance covers, and that is exactly what survives
-    //     execution.
+    // Two orderings exhaust it:
     //
-    // Which is why gates (b) and (c) above are driven by the requester's withdrawal: their
-    // request stands for MAX_REQUEST_TTL, and the §9.3 inequality does not bound that.
+    //   claim then withdraw — the claim expires at `T_claim + window` and the withdrawal
+    //     lands at `T_w + DELAY` with `T_w >= T_claim`. Since DELAY > window, the claim is
+    //     strictly dead first.
+    //   withdraw then claim — availability has already dropped, so the engine only admits a
+    //     claim the *remaining* balance covers, and that is exactly what survives execution.
     let config = config();
-    let ttl = config.max_quote_ttl;
     let delay = config.withdrawal_delay;
-    assert!(delay > ttl, "the startup assertion guarantees this");
+    let windows = [
+        ("maker", config.max_quote_ttl),
+        ("requester", Dur(config.max_request_ttl.0 + config.max_settling_time.0)),
+    ];
 
     // Case one, at the worst instant: the withdrawal requested the same millisecond as the
-    // quote, which is the latest it can be while still preceding it.
-    for quote_at in [0_u64, 1, 999, 1_000] {
-        let withdraw_at = quote_at;
-        let quote_dies = quote_at + ttl.0;
-        let withdrawal_lands = withdraw_at + delay.0;
-        assert!(
-            quote_dies < withdrawal_lands,
-            "a quote written at {quote_at} outlives a withdrawal requested at {withdraw_at}"
-        );
+    // claim, which is the latest it can be while still preceding it.
+    for (side, window) in windows {
+        assert!(delay > window, "the {side} window is not covered by the timelock");
+        for claim_at in [0_u64, 1, 999, 1_000] {
+            let claim_dies = claim_at + window.0;
+            let withdrawal_lands = claim_at + delay.0;
+            assert!(
+                claim_dies < withdrawal_lands,
+                "a {side} claim written at {claim_at} outlives the withdrawal beside it"
+            );
+        }
     }
 
-    // Case two is enforced by admission, and the harness can watch it happen: after the
-    // request, the mirror the engine admits against no longer contains the money.
+    // Case two is enforced by admission, and the harness can watch it happen — for the maker
+    // side, where a fresh claim is admitted against the mirror.
     let mut harness = funded_harness();
     let stake = maker_contribution(FILL_A);
     harness.request_withdrawal(ALPHA, stake).unwrap();
@@ -425,6 +454,14 @@ fn a_maker_can_never_withdraw_out_from_under_a_live_quote() {
             })
             .is_err(),
         "a maker with a withdrawal pending cannot write a quote the remainder cannot cover"
+    );
+
+    // And the requester side: with their withdrawal pending they cannot open a new request
+    // against the same money either.
+    harness.request_withdrawal(REQUESTER, requester_reservation()).unwrap();
+    assert!(
+        harness.apply(three_leg_request()).is_err(),
+        "a requester with a withdrawal pending cannot open a request the remainder cannot cover"
     );
     harness.assert_cross_system_invariants();
 }
@@ -519,7 +556,7 @@ fn a_pending_withdrawal_does_not_kill_a_basket_already_in_flight() {
 
     // The pre-check and the settlement both look at the balance, so the basket is unharmed.
     assert_eq!(harness.custody().precheck(&bundle), Ok(()));
-    let outcomes = harness.submit_pending();
+    let outcomes = harness.settle_pending();
     let receipt = outcomes[0].expect("a pending withdrawal must not kill a basket in flight");
     assert_eq!(receipt.n_escrows, 3);
     assert_eq!(harness.custody().ledger().balance(ALPHA), Amount::ZERO, "into escrow");
@@ -534,7 +571,7 @@ fn a_withdrawal_executes_at_maturity_even_with_capital_locked_in_escrow() {
     // four-term inequality would be guaranteeing nothing about when money is safe to spend.
     let mut harness = funded_harness();
     matched_market(&mut harness);
-    harness.submit_pending()[0].expect("settles");
+    harness.settle_pending()[0].expect("settles");
     assert_eq!(harness.locked_escrows().count(), 3, "Alpha has capital locked in escrow");
     assert!(
         harness.locked_escrows().any(|(_, escrow)| escrow.maker() == ALPHA),
@@ -599,7 +636,15 @@ fn a_venue_whose_timelock_does_not_cover_the_lag_terms_fails_to_start() {
     // With every lag term zero the inequality reduces to `delay > max_quote_ttl` and a test
     // of the four-term form would pass without exercising three of its four terms
     // (CLAUDE 39). So a non-zero lag term is what does the violating.
-    let base = Config { withdrawal_delay: Dur(40_000), max_quote_ttl: Dur(30_000), ..config() };
+    // The claim windows are shrunk to fit under a 40s timelock so the lag terms are the only
+    // thing that can push the sum over it.
+    let base = Config {
+        withdrawal_delay: Dur(40_000),
+        max_quote_ttl: Dur(30_000),
+        max_request_ttl: Dur(20_000),
+        max_settling_time: Dur(5_000),
+        ..config()
+    };
     assert_eq!(base.max_indexer_lag, Dur::ZERO);
     assert!(
         Harness::new(base, TestClock::at(Ts(0)), TestClock::at(Ts(0))).is_ok(),
@@ -613,15 +658,12 @@ fn a_venue_whose_timelock_does_not_cover_the_lag_terms_fails_to_start() {
         Err(rfq_core::config::ConfigError::WithdrawalDelayTooShort)
     ));
 
-    // And the harm it prevents, not just the variant: under that configuration a quote can
-    // outlive the withdrawal that was requested before it was written.
-    let quote_dies_at = Dur(30_000);
-    let withdrawal_lands_at = violating.withdrawal_delay;
+    // And the harm it prevents, not just the variant: under that configuration the engine's
+    // view can be stale for longer than the timelock leaves the money present, so a claim
+    // admitted against the mirror can outlive the balance backing it.
     assert!(
-        quote_dies_at > withdrawal_lands_at.checked_add(Dur::ZERO).unwrap()
-            || violating.max_indexer_lag.0 + quote_dies_at.0 > withdrawal_lands_at.0,
-        "the refused configuration is one where a maker could withdraw out from under a \
-         quote that was live when accepted"
+        violating.max_quote_ttl.0 + violating.max_indexer_lag.0 > violating.withdrawal_delay.0,
+        "the refused configuration is one where a claim can outlive the money behind it"
     );
 
     // Each lag term is individually load-bearing.
@@ -646,7 +688,7 @@ fn conservation_counts_locked_escrows_only() {
     // because the natural repair is to weaken the assertion (CLAUDE 41).
     let mut harness = funded_harness();
     matched_market(&mut harness);
-    harness.submit_pending()[0].expect("settles");
+    harness.settle_pending()[0].expect("settles");
     harness.assert_cross_system_invariants();
 
     let locked = harness.locked_escrows().count();

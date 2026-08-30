@@ -901,11 +901,33 @@ after `WITHDRAWAL_DELAY`.
 The configuration invariant, asserted at startup with every term named:
 
 ```
-WITHDRAWAL_DELAY  >  MAX_QUOTE_TTL                     // how long a quote can bind
-                  +  CONFIRMATIONS × block_time        // balance-mirror lag (§2.3)
-                  +  max_indexer_lag                   // mirror lag
-                  +  max_settlement_inclusion_time     // submit → final
+WITHDRAWAL_DELAY  >  max( MAX_QUOTE_TTL,                          // maker's claim window
+                          MAX_REQUEST_TTL + MAX_SETTLING_TIME )   // requester's claim window
+                  +  CONFIRMATIONS × block_time                   // balance-mirror lag (§2.3)
+                  +  max_indexer_lag                              // mirror lag
+                  +  max_settlement_inclusion_time                // submit → final
 ```
+
+**A maximum over claim windows, not a single term**, because the two sides bind for different
+durations. A maker's capital is claimed for the life of a quote. A requester's is claimed
+from `SubmitRequest` until settlement resolves — the request's own lifetime plus the
+settling window. Bounding only the quote side leaves the requester able to have their own
+withdrawal mature inside their own basket's settlement window: it fails safe, costing them
+the trade and moving no money wrongly, but it is an unexplained asymmetry, and a design
+whose maker-side guarantee does not extend to requesters invites exactly that question.
+
+**The theorem this produces:** *no participant can withdraw out from under their own live
+claim.* Two orderings exhaust it. Claim then withdraw — the claim expires at
+`T_claim + window`, the withdrawal executes at `T_w + WITHDRAWAL_DELAY` with `T_w ≥ T_claim`,
+and the inequality makes `DELAY > window`, so the claim is strictly dead first. Withdraw
+then claim — availability has already dropped (§9.1), so the engine only admits what the
+remaining balance covers, which is exactly what survives execution.
+
+**Consequence for testing.** With every lag term at zero, insufficient-funds-at-settlement
+is therefore **unreachable by construction** — which is a property worth asserting, not a
+gap. It becomes reachable only with a non-zero mirror-lag term, because staleness is what
+lets the engine admit against capital already gone. Both halves belong in the gate: the
+theorem under v1 defaults, and the revert under injected lag.
 
 **Every term after the first is zero in v1** — custody is in-process, confirmation depth is
 zero, there is no indexer lag, inclusion is immediate. The inequality therefore cannot fail
@@ -1273,10 +1295,28 @@ previous single blanket claim was false for two of them.
 5. **Conservation** (§2.2): `Σ custody.free + Σ escrow notional == deposited − withdrawn`.
    Purely custody-side — `reserved` and `committed` are claims against `free`, not
    partitions of it, and adding them here would double-count.
-6. **Claim coverage** (§2.2): `∀ a: custody.free(a) ≥ reserved(a) + committed(a)`. A
-   violation means the core has promised capital custody does not hold.
-7. **Mirror agreement.** `mirror.free(a) == custody.free(a)` for all accounts — exact in
-   v1; in v2 this becomes a bounded-drift assertion, and the bound is the §9.3 lag terms.
+6. **Claim coverage** (§2.2), in the form that holds through the escrow window:
+
+   ```
+   ∀ a:  custody.balance(a) + Σ a's contributions in Locked escrows
+             ≥  reserved(a) + committed(a)
+   ```
+
+   This reduces to §2.2's `custody.free(a) ≥ reserved(a) + committed(a)` exactly where §2.2
+   states it — before any settlement confirms. Afterwards the narrower form is **false on a
+   correct system**: custody has moved the contributions out of balances into escrow while
+   the engine still shows that capital as committed. Against `balance` rather than
+   `availability`, because a participant may hold a pending withdrawal covering claimed
+   capital and the §9.3 timelock is what makes that safe.
+
+   One window is knowingly open: between custody reverting a settlement and the engine
+   learning of it, the engine shows capital as committed that custody has released. Its exit
+   is `SettlementFailed` (§8). Tests covering that window assert the specific violation by
+   name rather than the harness declining to look.
+7. **Mirror agreement.** The mirror projects **availability** (balance − pending
+   withdrawals), because that is the number admission is entitled to lend against (§9.1):
+   `mirror.available(a) == custody.available(a)` for all accounts — exact in v1; in v2 a
+   bounded-drift assertion whose bound is the §9.3 lag terms.
 8. **Escrow contributions** sum to notional, and each escrow stores both sides separately.
 
 **Graph property, asserted once by an exhaustive reachability test:**

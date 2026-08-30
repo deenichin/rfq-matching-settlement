@@ -19,8 +19,9 @@ use crate::event::{Event, EventBuffer, EventBufferFull, IntentLeg, OpenLeg, Quot
 use crate::ledger::{Ledger, LedgerError};
 use crate::quote::{Quote, QuoteIdx, QuoteState};
 use crate::request::{Leg, Nonce, ReqIdx, Request, RequestState, Selection};
-use crate::reservation::Reservation;
+use crate::reservation::{ResOwner, Reservation};
 use crate::selection::{NoQuoteReason, best_on_leg, standing_quote_of, walk_leg};
+use crate::settlement::TxStatus;
 use crate::types::{Amount, LegId, Price, Size, Ts, UNIT};
 
 /// A rejected command. Each variant names the specific cause (CLAUDE 24); there is no
@@ -96,6 +97,9 @@ pub enum EngineError {
     // ── AcceptRequest (§7) ──
     /// The accept's view covers a different number of legs than the request has.
     LegCountMismatch,
+    /// A poll named a request that is not `Settling`. There is no nonce to report on, and a
+    /// terminal request must not be moved again (§8.1's monotonicity, one level up).
+    RequestNotSettling,
     /// A leg has no fill, so the whole basket aborts (§7.2).
     NoEligibleQuote {
         /// Which leg.
@@ -239,6 +243,9 @@ impl Engine {
             Command::AcceptRequest { request, expected, n_legs } => {
                 self.accept_request(request, &expected, n_legs, now, events)
             }
+            Command::PollSettlement { request, status } => {
+                self.poll_settlement(request, status, now, events)
+            }
         };
 
         // §15.3's state-coherence half is a whole-command property: a commit phase that
@@ -275,7 +282,9 @@ impl Engine {
                 touched[0] = Some(maker);
                 touched[1] = self.ledger.request(request).map(Request::requester);
             }
-            Command::RejectRequest { request } | Command::AcceptRequest { request, .. } => {
+            Command::RejectRequest { request }
+            | Command::AcceptRequest { request, .. }
+            | Command::PollSettlement { request, .. } => {
                 touched[0] = self.ledger.request(request).map(Request::requester);
             }
             Command::CancelQuote { quote } => {
@@ -581,8 +590,9 @@ impl Engine {
         commit.commit(requester_claim, request, requester_total);
 
         let nonce = Nonce::of(request);
+        let deadline = now.saturating_add(self.config.max_settling_time);
         if let Some(record) = commit.request_mut(request) {
-            record.set_state(RequestState::Settling(nonce));
+            record.set_state(RequestState::Settling { nonce, deadline });
         }
 
         // Settlement is never called here. Commit performs local, infallible bookkeeping and
@@ -680,6 +690,124 @@ impl Engine {
             }
         }
         Ok(intent)
+    }
+
+    // ────────────────────────────── PollSettlement (§8) ──────────────────────────────
+
+    /// Act on what a poller observed about a settling request's nonce.
+    ///
+    /// Three outcomes, not two, and only two of them are answers:
+    ///
+    /// - `Settled` — the escrows exist. The committed capital has left the core's books.
+    /// - `Reverted` — the trade did not happen. Every committed claim goes back to `free`.
+    /// - `Unknown` or `Pending` — **no local answer exists, so nothing moves.** Past the
+    ///   settling deadline this raises an operator alert and polling continues. Releasing
+    ///   here is the duplication path: the maker requotes the same capital and the original
+    ///   transaction lands (§8.1, §8.3).
+    ///
+    /// `Reverted` is trusted because it is the fate of the *nonce*, not of a submission. A
+    /// retry bouncing off its own consumed nonce reverts while the nonce stays `Settled`, so
+    /// that revert never reaches here (§8.1).
+    fn poll_settlement(
+        &mut self,
+        request: ReqIdx,
+        status: TxStatus,
+        now: Ts,
+        events: &mut EventBuffer,
+    ) -> Result<(), EngineError> {
+        // ── PLAN / CHECK ──
+        let record = *self.ledger.request(request).ok_or(EngineError::UnknownRequest)?;
+        let RequestState::Settling { nonce, deadline } = record.state() else {
+            return Err(EngineError::RequestNotSettling);
+        };
+
+        match status {
+            TxStatus::Unknown | TxStatus::Pending => {
+                if now < deadline {
+                    return Ok(());
+                }
+                events.headroom(1)?;
+                // ── COMMIT ──
+                events.push(Event::SettlementStalled { request, nonce, status });
+                Ok(())
+            }
+            TxStatus::Settled => {
+                events.headroom(1)?;
+                // ── COMMIT ──
+                let mut commit = self.ledger.commit_phase();
+                commit.discharge_committed(request, |_, _| {});
+                if let Some(record) = commit.request_mut(request) {
+                    record.set_state(RequestState::Escrowed);
+                }
+                self.close_consumed_quotes(request);
+                events.push(Event::RequestEscrowed { request, nonce });
+                Ok(())
+            }
+            TxStatus::Reverted => {
+                // One notice per released maker claim, plus the request-level event. Bounded
+                // by `MAX_LEGS + 1` because a request has at most one winning quote per leg.
+                let worst_case = usize::from(record.n_legs())
+                    .checked_add(1)
+                    .ok_or(EngineError::AmountOverflow)?;
+                events.headroom(worst_case)?;
+
+                // ── COMMIT ──
+                let mut notices: [Option<(QuoteIdx, AccountIdx)>; MAX_LEGS] = [None; MAX_LEGS];
+                let mut count = 0_usize;
+                let quotes = &mut notices;
+                self.ledger.commit_phase().discharge_committed(request, |owner, _| {
+                    if let ResOwner::Quote(quote) = owner
+                        && let Some(slot) = quotes.get_mut(count)
+                    {
+                        *slot = Some((quote, AccountIdx(0)));
+                        count = count.saturating_add(1);
+                    }
+                });
+                for entry in notices.iter_mut().flatten() {
+                    if let Some(maker) = self.ledger.quote(entry.0).map(Quote::maker) {
+                        entry.1 = maker;
+                    }
+                }
+                for (quote, maker) in notices.into_iter().flatten() {
+                    events.push(Event::QuoteRejected {
+                        quote,
+                        maker,
+                        reason: QuoteRejectReason::SettlementFailed,
+                    });
+                }
+                self.close_consumed_quotes(request);
+                if let Some(record) = self.ledger.commit_phase().request_mut(request) {
+                    record.set_state(RequestState::SettlementFailed);
+                }
+                events.push(Event::RequestSettlementFailed { request, nonce });
+                Ok(())
+            }
+        }
+    }
+
+    /// Free the slots of every `Consumed` quote on a request whose claims have been
+    /// discharged.
+    ///
+    /// A `Consumed` quote's slot was kept alive only because a committed claim named it as
+    /// its owner and that owner must resolve (§15.3). Once the claim is gone the slot has no
+    /// reader, and keeping it would grow occupancy by message history rather than by live
+    /// capital.
+    fn close_consumed_quotes(&mut self, request: ReqIdx) {
+        let mut doomed: [Option<QuoteIdx>; MAX_LEGS] = [None; MAX_LEGS];
+        let mut count = 0_usize;
+        for (handle, quote) in self.ledger.quotes() {
+            if quote.request() == request
+                && matches!(quote.state(), QuoteState::Consumed)
+                && quote.claim().is_none()
+                && let Some(slot) = doomed.get_mut(count)
+            {
+                *slot = Some(handle);
+                count = count.saturating_add(1);
+            }
+        }
+        for handle in doomed.into_iter().flatten() {
+            self.ledger.commit_phase().close_quote(handle);
+        }
     }
 
     // ────────────────────────────── shared commit-phase helpers ──────────────────────────

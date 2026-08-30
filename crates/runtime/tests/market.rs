@@ -261,7 +261,7 @@ fn three_mixed_side_legs_five_quotes_and_a_correct_fill() {
 
     // The request is Settling, and the intent carries the whole bundle — custody cannot
     // reach back into the engine for what it is missing (§13.1).
-    let RequestState::Settling(nonce) =
+    let RequestState::Settling { nonce, .. } =
         market.engine.ledger().request(request).unwrap().state()
     else {
         panic!("the request must be Settling");
@@ -288,7 +288,7 @@ fn three_mixed_side_legs_five_quotes_and_a_correct_fill() {
     // Escrow does not exist at the end of S2 (§7.2). Nothing here forms one.
     assert!(matches!(
         market.engine.ledger().request(request).unwrap().state(),
-        RequestState::Settling(_)
+        RequestState::Settling { .. }
     ));
 }
 

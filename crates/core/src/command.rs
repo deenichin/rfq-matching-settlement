@@ -13,8 +13,8 @@
 //! contract wording, resolution sources — exist only at the gateway, which converts them to
 //! dense indices before a command is ever built (§3, CLAUDE 11).
 //!
-//! `PollSettlement` (S4), `ReportOracleStatus` and `SettleEscrow` (S5) arrive with the
-//! stages that can apply them. A named variant nothing can execute is a stub.
+//! `ReportOracleStatus` and `SettleEscrow` (S5) arrive with the stages that can apply them.
+//! A named variant nothing can execute is a stub.
 //!
 //! Authorisation is designed and not enforced: §16 excludes signatures, so "requester only"
 //! and "oracle adapter only" are the gateway's boundary, not the engine's.
@@ -24,6 +24,7 @@ use crate::config::MAX_LEGS;
 use crate::contract::ContractIdx;
 use crate::quote::QuoteIdx;
 use crate::request::ReqIdx;
+use crate::settlement::TxStatus;
 use crate::types::{Amount, LegId, Price, Side, Size, Ts};
 
 /// One leg of a `SubmitRequest`: what to trade, which side, how much, and the most the
@@ -116,6 +117,21 @@ pub enum Command {
     CancelQuote {
         /// The quote the maker wishes they had not written.
         quote: QuoteIdx,
+    },
+    /// Report what a poller observed about a settling request's nonce (§8).
+    ///
+    /// An ordinary command from an external actor, on the same queue as everything else.
+    /// The engine never calls custody to ask: the status is *carried in*, because the only
+    /// path from custody back to the engine is a fact translated into a command (§13.1).
+    ///
+    /// Anyone may send it — the indexer, in practice. There is nothing to authorise: the
+    /// command carries no discretion, and a wrong status is a lying poller, which is the
+    /// same trust boundary the oracle sits behind.
+    PollSettlement {
+        /// Which request.
+        request: ReqIdx,
+        /// The fate of that request's nonce, as observed.
+        status: TxStatus,
     },
     /// The requester accepts, carrying the per-leg prices they were shown (§7.1.1).
     ///

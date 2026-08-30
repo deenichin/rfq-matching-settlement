@@ -20,20 +20,57 @@ fn the_default_configuration_starts() {
 }
 
 #[test]
-fn a_lag_term_alone_can_violate_the_four_term_timelock_inequality() {
-    // withdrawal_delay = 40s, max_quote_ttl = 30s. Against the two-term form
-    // `withdrawal_delay > MAX_QUOTE_TTL` this configuration is fine, and that is the point:
-    // the shortfall lives entirely in the terms a v1-only reading would have dropped.
-    let base =
-        Config { withdrawal_delay: Dur(40_000), max_quote_ttl: Dur(30_000), ..Config::default() };
+fn the_claim_window_is_a_maximum_over_both_sides_not_the_quote_side_alone() {
+    // §9.3's first term is `max(MAX_QUOTE_TTL, MAX_REQUEST_TTL + MAX_SETTLING_TIME)`. A
+    // maker's capital is claimed for the life of a quote; a requester's from SubmitRequest
+    // until settlement resolves. Taking the quote side alone leaves a requester able to have
+    // their own withdrawal mature inside their own basket's settlement window.
+    let quote_side_only = Config {
+        max_quote_ttl: Dur(30_000),
+        max_request_ttl: Dur(300_000),
+        max_settling_time: Dur(60_000),
+        min_horizon: Dur(3_600_000),
+        // Comfortably above the maker window of 30s, and below the requester window of 6min.
+        withdrawal_delay: Dur(120_000),
+        ..Config::default()
+    };
+    assert!(
+        quote_side_only.withdrawal_delay > quote_side_only.max_quote_ttl,
+        "the maker window is satisfied, which is the precondition this test needs"
+    );
+    assert_eq!(quote_side_only.validate(), Err(ConfigError::WithdrawalDelayTooShort));
+
+    // Widening the delay past the requester window is what makes it start.
+    let requester_window = Dur(300_000 + 60_000);
+    let sufficient = Config { withdrawal_delay: Dur(requester_window.0 + 1), ..quote_side_only };
+    assert_eq!(sufficient.validate(), Ok(()));
+    let exactly_equal = Config { withdrawal_delay: requester_window, ..quote_side_only };
+    assert_eq!(exactly_equal.validate(), Err(ConfigError::WithdrawalDelayTooShort));
+}
+
+#[test]
+fn a_lag_term_alone_can_violate_the_timelock_inequality() {
+    // withdrawal_delay = 40s against a claim window of 30s. Against the claim-window term
+    // alone this configuration is fine, and that is the point: the shortfall lives entirely
+    // in the terms a v1-only reading would have dropped.
+    let base = Config {
+        withdrawal_delay: Dur(40_000),
+        max_quote_ttl: Dur(30_000),
+        // Kept below the maker window so the maximum is the quote side and the lag terms are
+        // what does the violating.
+        max_request_ttl: Dur(20_000),
+        max_settling_time: Dur(5_000),
+        min_horizon: Dur(3_600_000),
+        ..Config::default()
+    };
 
     // Precondition (CLAUDE 39): with every lag term zero it starts. If this failed, the
-    // test below would be proving something other than what it claims.
+    // assertions below would be proving something other than what they claim.
     assert_eq!(base.confirmations, 0);
     assert_eq!(base.block_time, Dur::ZERO);
     assert_eq!(base.max_indexer_lag, Dur::ZERO);
     assert_eq!(base.max_settlement_inclusion_time, Dur::ZERO);
-    assert_eq!(base.validate(), Ok(()), "the two-term form is satisfied");
+    assert_eq!(base.validate(), Ok(()), "the claim-window term alone is satisfied");
 
     // CONFIRMATIONS × block_time: 12 × 1s = 12s. 30 + 12 > 40.
     let confirmation_lag = Config { confirmations: 12, block_time: Dur(1_000), ..base };

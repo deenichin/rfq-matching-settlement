@@ -19,7 +19,9 @@
 //!   that can *report* divergence, not an oracle of truth that prevents it.
 
 use rfq_chain::bundle::Bundle;
-use rfq_chain::custody::{Custody, CustodyError, SettleError, SettleReceipt};
+use rfq_chain::custody::{
+    Custody, CustodyError, IncludedTx, SettleError, SettleReceipt, SubmitAck,
+};
 use rfq_chain::escrow::Escrow;
 use rfq_core::account::{AccountIdx, MirroredBalance};
 use rfq_core::clock::{Clock, SettableClock};
@@ -27,7 +29,9 @@ use rfq_core::command::Command;
 use rfq_core::config::{Config, ConfigError};
 use rfq_core::engine::{Engine, EngineError};
 use rfq_core::escrow::EscrowId;
-use rfq_core::event::EventBuffer;
+use rfq_core::event::{Event, EventBuffer};
+use rfq_core::request::ReqIdx;
+use rfq_core::settlement::TxStatus;
 use rfq_core::types::{Amount, Ts};
 
 use crate::settlement;
@@ -64,6 +68,16 @@ pub struct Harness<EC: Clock, CC: Clock> {
     pending: Vec<Bundle>,
     /// Escrows formed so far, in the order settlement produced them.
     escrows: Vec<EscrowId>,
+    /// Whether balance changes are being withheld from the engine's mirror.
+    indexer_stalled: bool,
+    /// Bundles that have been sent and whose nonce has no terminal answer yet.
+    ///
+    /// The submitter keeps them, which is what makes a retry possible at all: an
+    /// acknowledgement can be lost, and the only way to ask again is to still have the thing
+    /// you sent (§8.1).
+    in_flight: Vec<Bundle>,
+    /// Every event the engine has emitted, in order.
+    emitted: Vec<Event>,
 }
 
 impl<EC: Clock, CC: Clock + core::fmt::Debug> core::fmt::Debug for Harness<EC, CC> {
@@ -98,6 +112,9 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
             events: EventBuffer::with_capacity(64),
             pending: Vec::new(),
             escrows: Vec::new(),
+            indexer_stalled: false,
+            in_flight: Vec::new(),
+            emitted: Vec::new(),
         })
     }
 
@@ -240,39 +257,121 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
 
         // The engine → custody wire: the adapter picks `SubmitIntent` off the stream and
         // turns it into a bundle. Nothing else crosses.
-        for event in self.events.drain() {
-            if let Some(bundle) = settlement::bundle_from(&event) {
+        let emitted: Vec<Event> = self.events.drain().collect();
+        for event in &emitted {
+            if let Some(bundle) = settlement::bundle_from(event) {
                 self.pending.push(bundle);
             }
         }
+        self.emitted.extend(emitted);
 
         self.assert_cross_system_invariants();
         outcome.map_err(HarnessError::Engine)
     }
 
-    /// Submit every bundle the adapter has picked up, in order.
+    /// Hand every bundle the adapter has picked up to custody, in order.
     ///
-    /// Returns each bundle's outcome. A revert is not an error of the harness: it is the
-    /// answer, and the basket aborts safely.
+    /// **Sent, and nothing more.** Nothing is included until the test says so, because the
+    /// interval between the two is the one §8.1 is about.
+    pub fn submit_pending(&mut self) -> Vec<SubmitAck> {
+        let bundles: Vec<Bundle> = self.pending.drain(..).collect();
+        bundles
+            .into_iter()
+            .map(|bundle| {
+                self.in_flight.push(bundle);
+                self.custody.submit(bundle)
+            })
+            .collect()
+    }
+
+    /// Send a settling request's bundle again.
+    ///
+    /// Models the retry after a lost acknowledgement. The bundle is byte-identical and so is
+    /// its nonce, which is the whole point: an idempotent nonce turns "unknown" from a
+    /// catastrophe into a delay. Nothing is re-derived from engine state — the submitter
+    /// resends what it sent.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Engine`] if the request is not settling, or if no bundle carrying its
+    /// nonce was ever sent — a submitter that has lost what it sent cannot retry, which is
+    /// the one thing §8.1's answer depends on.
+    pub fn resubmit(&mut self, request: ReqIdx) -> Result<SubmitAck, HarnessError> {
+        let nonce = self
+            .engine
+            .ledger()
+            .request(request)
+            .and_then(|record| record.state().nonce())
+            .ok_or(HarnessError::Engine(EngineError::RequestNotSettling))?;
+        let bundle = *self
+            .in_flight
+            .iter()
+            .find(|bundle| bundle.nonce == nonce)
+            .ok_or(HarnessError::Engine(EngineError::RequestNotSettling))?;
+        Ok(self.custody.submit(bundle))
+    }
+
+    /// Everything the engine has emitted, in order.
+    #[must_use]
+    pub fn emitted(&self) -> &[Event] {
+        &self.emitted
+    }
+
+    /// Throw away the oldest pending submission without including it.
+    ///
+    /// The send that never arrived. The nonce stays `Unknown`, which is not an answer.
+    pub fn lose_next_submission(&mut self) -> bool {
+        self.custody.drop_next_submission()
+    }
+
+    /// Include everything the chain has been handed, oldest first.
     ///
     /// # Panics
     ///
     /// If a cross-system invariant broke.
-    pub fn submit_pending(&mut self) -> Vec<Result<SettleReceipt, SettleError>> {
-        let bundles: Vec<Bundle> = self.pending.drain(..).collect();
-        let mut outcomes = Vec::with_capacity(bundles.len());
-        for bundle in bundles {
-            let outcome = self.custody.settle(&bundle);
-            if let Ok(receipt) = &outcome {
+    pub fn include_all(&mut self) -> Vec<IncludedTx> {
+        let included = self.custody.include_all();
+        for tx in &included {
+            if let Ok(receipt) = &tx.outcome {
                 for id in receipt.escrows.iter().take(usize::from(receipt.n_escrows)) {
                     self.escrows.push(*id);
                 }
             }
-            outcomes.push(outcome);
-            self.mirror_all();
-            self.assert_settlement_invariants();
         }
-        outcomes
+        self.mirror_all();
+        self.assert_settlement_invariants();
+        included
+    }
+
+    /// Submit and include in one step, for a test that is not about the interval.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke.
+    pub fn settle_pending(&mut self) -> Vec<Result<SettleReceipt, SettleError>> {
+        self.submit_pending();
+        self.include_all().into_iter().map(|tx| tx.outcome).collect()
+    }
+
+    /// Read a request's nonce status the way a poller would, and hand it to the engine as a
+    /// command.
+    ///
+    /// This is the custody → engine wire. The engine is never given a reference to custody:
+    /// a fact is read on one side and delivered as a command on the other, which is the only
+    /// shape that survives custody being on another machine (§13.1).
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Engine`] if the engine refused the poll.
+    pub fn poll_settlement(&mut self, request: ReqIdx) -> Result<TxStatus, HarnessError> {
+        let Some(nonce) =
+            self.engine.ledger().request(request).and_then(|record| record.state().nonce())
+        else {
+            return Err(HarnessError::Engine(EngineError::RequestNotSettling));
+        };
+        let status = self.custody.status(nonce);
+        self.apply(Command::PollSettlement { request, status })?;
+        Ok(status)
     }
 
     /// Bring the engine's mirror of one account back in line with custody.
@@ -282,6 +381,9 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// depth, dedup — and that is where the mirror stops being exact and starts being
     /// lagged (§2.3, §12).
     fn mirror(&mut self, account: AccountIdx) -> Result<(), HarnessError> {
+        if self.indexer_stalled {
+            return Ok(());
+        }
         // Availability, not balance: this is the number admission is entitled to lend
         // against (§9.1).
         let free = self.custody.ledger().available(account);
@@ -296,6 +398,64 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
         for index in 0..self.custody.ledger().account_count() {
             let _ = self.mirror(AccountIdx(index));
         }
+    }
+
+    /// Stop propagating custody's balance changes to the engine's mirror.
+    ///
+    /// Models a non-zero `max_indexer_lag`: the chain has moved and the engine has not
+    /// heard. Staleness is the *only* thing that lets the engine admit against capital
+    /// already gone — with the §9.3 inequality holding and every lag term at zero, no
+    /// participant can withdraw out from under their own live claim, so an
+    /// insufficient-funds settlement is unreachable by construction.
+    ///
+    /// # Panics
+    ///
+    /// If the configuration claims zero indexer lag. A harness that exhibits lag a venue
+    /// says it does not have is testing a different venue.
+    pub fn stall_indexer(&mut self) {
+        assert!(
+            self.engine.config().max_indexer_lag > rfq_core::types::Dur::ZERO,
+            "a venue configured for zero indexer lag must not be made to exhibit any"
+        );
+        self.indexer_stalled = true;
+    }
+
+    /// Write a stale value into the engine's mirror, as a lagging indexer would leave it.
+    ///
+    /// Only meaningful while the indexer is stalled: it puts the engine's view where a real
+    /// indexer's cursor would have left it, rather than requiring the test to have stalled
+    /// the wire before the balance moved.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Engine`] if the engine refuses the update.
+    ///
+    /// # Panics
+    ///
+    /// If the indexer is not stalled. Writing a stale value into a mirror nothing is holding
+    /// back would be manufacturing a divergence the venue does not have.
+    pub fn mirror_stale_for_test(
+        &mut self,
+        account: AccountIdx,
+        free: Amount,
+    ) -> Result<(), HarnessError> {
+        assert!(self.indexer_stalled, "a stale mirror value needs a stalled indexer");
+        let now = self.engine_clock.now();
+        self.events.clear();
+        self.engine
+            .apply(Command::CreditAccount { account, free }, now, &mut self.events)
+            .map_err(HarnessError::Engine)
+    }
+
+    /// Resume propagation and catch the mirror up.
+    ///
+    /// # Panics
+    ///
+    /// If a cross-system invariant broke once the engine has caught up.
+    pub fn resume_indexer(&mut self) {
+        self.indexer_stalled = false;
+        self.mirror_all();
+        self.assert_settlement_invariants();
     }
 
     /// Every cross-system invariant, run after every command in tests and scenarios
@@ -472,6 +632,12 @@ impl<EC: Clock, CC: Clock> Harness<EC, CC> {
     /// and reads the balance directly; the two are different numbers on purpose, and the
     /// mirror is the one admission uses.
     fn check_mirror_agreement(&self) -> Result<(), CrossSystemViolation> {
+        if self.indexer_stalled {
+            // Exact in v1 only because there is no lag. Under injected lag the assertion
+            // becomes bounded drift, and the bound is the §9.3 lag terms — which this
+            // harness does not model in time, so it does not pretend to check it.
+            return Ok(());
+        }
         let ledger = self.custody.ledger();
         for index in 0..ledger.account_count() {
             let account = AccountIdx(index);
