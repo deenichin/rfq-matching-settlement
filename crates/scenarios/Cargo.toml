@@ -1,0 +1,15 @@
+# The scenario runner: named end-to-end traces, printed. A leaf binary — nothing depends
+# on it. This is deliverable 2 and is filled in by S7.
+[package]
+name = "rfq-scenarios"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfq-core = { workspace = true }
+rfq-chain = { workspace = true }
+rfq-runtime = { workspace = true }
+
+[lints]
+workspace = true

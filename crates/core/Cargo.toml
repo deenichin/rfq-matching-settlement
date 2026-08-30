@@ -1,0 +1,15 @@
+# The ENGINE. Zero dependencies (CLAUDE 36), and specifically no dependency on
+# rfq-chain (CLAUDE 8b, SPEC §13.1). build.rs enforces both at compile time.
+[package]
+name = "rfq-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

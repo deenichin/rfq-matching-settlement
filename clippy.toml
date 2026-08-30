@@ -1,0 +1,11 @@
+# Rule 3 — no HashMap/HashSet anywhere; iteration order must never reach a decision or
+# an emitted event. Where a map is unavoidable at the gateway boundary, it is a BTreeMap.
+#
+# Rule 1 — Instant and SystemTime are readable only inside a Clock implementation. There
+# is exactly one such `allow` in the workspace, in rfq-runtime's clock module.
+disallowed-types = [
+    "std::collections::HashMap",
+    "std::collections::HashSet",
+    "std::time::Instant",
+    "std::time::SystemTime",
+]

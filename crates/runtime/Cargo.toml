@@ -1,0 +1,15 @@
+# Wiring: clock implementations, the command channel, the publisher, the settlement
+# adapter, and the HARNESS that owns one engine and one custody and drives the wires
+# between them (SPEC §13.1).
+[package]
+name = "rfq-runtime"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfq-core = { workspace = true }
+rfq-chain = { workspace = true }
+
+[lints]
+workspace = true

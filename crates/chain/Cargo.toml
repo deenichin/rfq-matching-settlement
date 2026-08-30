@@ -1,0 +1,15 @@
+# CUSTODY and its neighbours: the escrow contract, the tx pool, the withdrawal timelock,
+# the event log, the mocked oracle, the indexer. Depends on rfq-core for shared value
+# types only (SPEC §13.1) and knows nothing of requests, quotes, legs, reservations or
+# claims. Never depends on rfq-runtime.
+[package]
+name = "rfq-chain"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rfq-core = { workspace = true }
+
+[lints]
+workspace = true

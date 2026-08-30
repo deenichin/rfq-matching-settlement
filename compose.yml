@@ -1,0 +1,40 @@
+# Three services over one toolchain image. Each mounts the working tree read-write at /app
+# and shares one named volume for build artifacts, so a second service reuses the first's
+# compilation rather than repeating it.
+#
+# The tree is mounted, not copied: a `docker compose run` without `--build` must still pick
+# up every edit made since the image was built, including a test added a minute ago. That
+# is checked in the S0 gate by adding a failing test, running without `--build`, and
+# watching it fail.
+name: outcome-rfq
+
+x-toolchain: &toolchain
+  build:
+    context: .
+  image: outcome-rfq-toolchain
+  working_dir: /app
+  environment:
+    CARGO_TARGET_DIR: /target
+  volumes:
+    - .:/app
+    - build-artifacts:/target
+
+services:
+  # Every gate in PLAN.md is a passing test, not a manual check (CLAUDE 26).
+  test:
+    <<: *toolchain
+    command: ["cargo", "test", "--locked", "--workspace"]
+
+  # Deliverable 2: the named end-to-end traces (S7).
+  scenarios:
+    <<: *toolchain
+    command: ["cargo", "run", "--locked", "-p", "rfq-scenarios"]
+
+  # The CLAUDE.md rules a compiler can check are workspace lints; this is where they run.
+  lint:
+    <<: *toolchain
+    command:
+      ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+volumes:
+  build-artifacts:
