@@ -7,7 +7,7 @@
 //! value, so the constant bounds storage and the config bounds policy, with the config
 //! checked against the constant at startup (SPEC §3).
 
-use crate::types::Ts;
+use crate::types::Dur;
 
 /// Compile-time storage bound on legs per request.
 ///
@@ -25,6 +25,10 @@ pub const MAX_QUOTES_PER_LEG: usize = 16;
 
 /// Venue policy: every value the design leaves open, in one injectable structure.
 ///
+/// Every bound here is a [`Dur`] — a length of time, never an instant. Both startup
+/// assertions below are therefore `Dur`-to-`Dur` comparisons, which is what they were
+/// always doing informally (SPEC §4.0, CLAUDE 12b).
+///
 /// Constructed once at startup and validated by [`Config::validate`]. The lag terms
 /// default to zero because every term after the first in the §9.3 inequality *is* zero in
 /// v1 — custody is in-process, confirmation depth is zero, inclusion is immediate. They
@@ -38,29 +42,31 @@ pub struct Config {
     pub max_quotes_per_leg: u8,
     /// Longest lifetime a maker may give a quote (SPEC §6). A market-structure input
     /// (SPEC §14), coupled to `withdrawal_delay` by the §9.3 inequality and by nothing else.
-    pub max_quote_ttl: Ts,
+    pub max_quote_ttl: Dur,
     /// Longest `deadline − now` a request may ask for; beyond it, `DeadlineTooFar`.
-    pub max_request_ttl: Ts,
+    pub max_request_ttl: Dur,
     /// A contract may not be traded within this distance of its `event_date`;
     /// inside it, `ContractTooNear` (SPEC §5.2).
-    pub min_horizon: Ts,
+    pub min_horizon: Dur,
     /// Longest a request may sit in `Settling` before the timeout policy of SPEC §8.3
     /// escalates. Escalation is continued polling plus an alert, never an abort.
-    pub max_settling_time: Ts,
+    pub max_settling_time: Dur,
     /// How long after `event_date` a silent oracle must stay silent before the stall exit
     /// admits `Void` (SPEC §10.2). Long relative to any plausible honest delay.
-    pub stall_grace: Ts,
+    pub stall_grace: Dur,
     /// Delay between `RequestWithdrawal` and execution (SPEC §9.3). The first term of the
     /// inequality below and the reason soft reservation is safe at all.
-    pub withdrawal_delay: Ts,
+    pub withdrawal_delay: Dur,
     /// Confirmation depth the balance mirror waits for. Zero in v1 (SPEC §2.3).
+    ///
+    /// A count, not a duration: it becomes one only when multiplied by `block_time`.
     pub confirmations: u32,
     /// Block time, multiplied by `confirmations` to give the mirror's confirmation lag.
-    pub block_time: Ts,
+    pub block_time: Dur,
     /// Worst-case indexer lag on top of confirmation depth. Zero in v1.
-    pub max_indexer_lag: Ts,
+    pub max_indexer_lag: Dur,
     /// Worst-case submit-to-final settlement inclusion time. Zero in v1.
-    pub max_settlement_inclusion_time: Ts,
+    pub max_settlement_inclusion_time: Dur,
 }
 
 /// A configuration that must not be allowed to start.
@@ -147,21 +153,21 @@ impl Default for Config {
             max_legs: 4,
             max_quotes_per_leg: 8,
             // 30s: a maker round trip plus room to reprice.
-            max_quote_ttl: Ts(30_000),
+            max_quote_ttl: Dur(30_000),
             // 5min: long enough to collect quotes, short enough that the free option a
             // firm quote represents stays cheap (SPEC §11).
-            max_request_ttl: Ts(300_000),
+            max_request_ttl: Dur(300_000),
             // 1h, comfortably above max_request_ttl + max_settling_time = 6min.
-            min_horizon: Ts(3_600_000),
-            max_settling_time: Ts(60_000),
+            min_horizon: Dur(3_600_000),
+            max_settling_time: Dur(60_000),
             // 24h of oracle silence before the stall exit admits Void.
-            stall_grace: Ts(86_400_000),
+            stall_grace: Dur(86_400_000),
             // 10min, comfortably above max_quote_ttl + 0 + 0 + 0 = 30s.
-            withdrawal_delay: Ts(600_000),
+            withdrawal_delay: Dur(600_000),
             confirmations: 0,
-            block_time: Ts::ZERO,
-            max_indexer_lag: Ts::ZERO,
-            max_settlement_inclusion_time: Ts::ZERO,
+            block_time: Dur::ZERO,
+            max_indexer_lag: Dur::ZERO,
+            max_settlement_inclusion_time: Dur::ZERO,
         }
     }
 }

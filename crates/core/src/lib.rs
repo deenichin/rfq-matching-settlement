@@ -29,4 +29,4 @@ pub use config::{Config, ConfigError, MAX_LEGS, MAX_QUOTES_PER_LEG};
 pub use engine::Engine;
 pub use event::Event;
 pub use slab::{Handle, Slab, SlabFull};
-pub use types::{Amount, Price, Size, Ts, UNIT};
+pub use types::{Amount, Dur, Price, Size, Ts, UNIT};

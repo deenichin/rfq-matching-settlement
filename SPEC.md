@@ -216,9 +216,27 @@ is a rejection with a distinct error, not a reallocation.
 
 ## 4. Time
 
-### 4.0 Unit
+### 4.0 Units: instants and durations
 
-`Ts` is **milliseconds** since an arbitrary epoch, `u64`. Quote lifetimes are seconds and
+`Ts` is an **instant** — milliseconds since an arbitrary epoch, `u64`. `Dur` is a
+**duration** in the same unit, and is a separate type:
+
+```
+Ts  + Dur -> Ts        expires_at = now + ttl
+Ts  - Ts  -> Dur       time remaining
+Dur + Dur -> Dur       the four-term timelock sum (§9.3)
+Ts  + Ts  -> does not exist
+```
+
+The separation is not decoration. The timelock inequality sums four durations and compares
+the result to a duration; expiry compares two instants; `MIN_HORIZON` guards a gap between
+instants. Collapsing both onto one type makes `Ts + Ts` compile while meaning nothing, which
+is the same class of error `Amount` exists to prevent on the money side. Every configured
+bound — `MAX_QUOTE_TTL`, `MAX_REQUEST_TTL`, `MIN_HORIZON`, `MAX_SETTLING_TIME`,
+`STALL_GRACE`, `WITHDRAWAL_DELAY` and its lag terms — is a `Dur`. Every expiry, deadline and
+event date is a `Ts`.
+
+`Ts` is `u64` milliseconds. Quote lifetimes are seconds and
 escrow lifetimes are months; a month is ~2.6e9 ms, so the range is not a concern and the
 resolution is finer than any decision the system makes. Coarser would lose quote-expiry
 resolution; finer buys nothing when the maker round trip dominates end-to-end latency.

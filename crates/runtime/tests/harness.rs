@@ -9,7 +9,7 @@
 
 use rfq_core::clock::{Clock, TestClock};
 use rfq_core::config::{Config, ConfigError};
-use rfq_core::types::Ts;
+use rfq_core::types::{Dur, Ts};
 use rfq_runtime::clock::MonotonicClock;
 use rfq_runtime::harness::Harness;
 
@@ -23,11 +23,11 @@ fn the_two_clocks_advance_independently() {
     assert_eq!(harness.engine_now(), Ts::ZERO);
     assert_eq!(harness.custody_now(), Ts::ZERO);
 
-    harness.engine_clock_mut().advance(Ts(1_000));
+    harness.engine_clock_mut().advance(Dur(1_000));
     assert_eq!(harness.engine_now(), Ts(1_000));
     assert_eq!(harness.custody_now(), Ts::ZERO, "advancing venue time must not move chain time");
 
-    harness.custody_clock_mut().advance(Ts(2_500));
+    harness.custody_clock_mut().advance(Dur(2_500));
     assert_eq!(harness.custody_now(), Ts(2_500));
     assert_eq!(harness.engine_now(), Ts(1_000), "advancing chain time must not move venue time");
 
@@ -42,11 +42,15 @@ fn custody_can_run_ahead_of_the_venue() {
     // quote the engine believes live is already expired at settlement. S3 gate (c2) turns
     // this into a settlement that reverts; S0 only has to make it representable.
     let mut harness = harness();
-    harness.engine_clock_mut().advance(Ts(5_000));
-    harness.custody_clock_mut().advance(Ts(8_000));
+    harness.engine_clock_mut().advance(Dur(5_000));
+    harness.custody_clock_mut().advance(Dur(8_000));
 
+    // The divergence is a *duration* — the gap between two timelines, not a third
+    // instant. `Ts − Ts -> Dur` is the only subtraction the types permit (SPEC §4.0).
+    let divergence: Dur = harness.custody_now().saturating_sub(harness.engine_now());
     assert!(harness.custody_now() > harness.engine_now());
-    assert_eq!(harness.custody_now().saturating_sub(harness.engine_now()), Ts(3_000));
+    assert_eq!(divergence, Dur(3_000));
+    assert_ne!(divergence, Dur::ZERO, "the property under test is a non-zero gap");
 }
 
 #[test]
@@ -55,17 +59,17 @@ fn the_harness_refuses_to_start_on_a_configuration_that_fails_its_assertions() {
     // is the engine's, WITHDRAWAL_DELAY is custody's. The harness is where they meet, so
     // it is where the refusal has to happen.
     let violating = Config {
-        withdrawal_delay: Ts(40_000),
-        max_quote_ttl: Ts(30_000),
-        max_indexer_lag: Ts(15_000),
+        withdrawal_delay: Dur(40_000),
+        max_quote_ttl: Dur(30_000),
+        max_indexer_lag: Dur(15_000),
         ..Config::default()
     };
-    assert_ne!(violating.max_indexer_lag, Ts::ZERO, "the lag term under test must be non-zero");
+    assert_ne!(violating.max_indexer_lag, Dur::ZERO, "the lag term under test must be non-zero");
 
     let refused = Harness::new(violating, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
     assert!(matches!(refused, Err(ConfigError::WithdrawalDelayTooShort)));
 
-    let short_horizon = Config { min_horizon: Ts(1_000), ..Config::default() };
+    let short_horizon = Config { min_horizon: Dur(1_000), ..Config::default() };
     let refused = Harness::new(short_horizon, TestClock::at(Ts::ZERO), TestClock::at(Ts::ZERO));
     assert!(matches!(refused, Err(ConfigError::HorizonTooShort)));
 }

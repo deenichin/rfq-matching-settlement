@@ -59,7 +59,8 @@ Nothing depends on `scenarios`.
 
 - Workspace: `core` (zero deps), `chain`, `runtime`, `scenarios`. `proptest` the only
   dev-dependency. Workspace lints per CLAUDE.md.
-- `Amount(u64)`, `Price(u32)`, `Size(u64)`, `Ts(u64)` newtypes
+- `Amount(u64)`, `Price(u32)`, `Size(u64)` newtypes; `Ts(u64)` instants and `Dur(u64)`
+  durations as **separate** types with only the operations of SPEC §4.0 defined
 - `Clock` trait + `TestClock` (settable) + `MonotonicClock`. **Custody gets its own
   instance** (SPEC §9.1) — two clocks from the start, offsettable in tests
 - Slab: preallocated, free list, **generation-counted `u32` handles**

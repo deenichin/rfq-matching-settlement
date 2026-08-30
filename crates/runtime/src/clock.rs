@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use rfq_core::clock::Clock;
-use rfq_core::types::Ts;
+use rfq_core::types::{Dur, Ts};
 
 /// A monotonic clock in milliseconds since construction (SPEC §4.0).
 ///
@@ -54,6 +54,7 @@ impl Clock for MonotonicClock {
         // is 584 million years old. Saturating rather than wrapping, because a clock that
         // wraps runs backwards and SPEC §4.1 requires monotonic.
         let elapsed_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.epoch.saturating_add(Ts(elapsed_ms))
+        // An elapsed time is a duration; the epoch is the instant it is measured from.
+        self.epoch.saturating_add(Dur(elapsed_ms))
     }
 }

@@ -79,6 +79,8 @@ design.
 
 ## Money
 
+12b. Instants and durations are distinct types: `Ts` and `Dur` (SPEC §4.0). `Ts + Ts` must
+    not compile. Configured bounds are `Dur`; expiries, deadlines and event dates are `Ts`.
 13. `Amount` is a newtype over `u64` minor units. Never `f32`/`f64` anywhere in the
     repository, including tests and scenario output.
 14. Every arithmetic operation on money uses `checked_*`. Overflow is a rejection, never a

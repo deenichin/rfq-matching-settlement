@@ -12,7 +12,7 @@
 //! settlement is written.
 
 use rfq_core::clock::Clock;
-use rfq_core::types::Ts;
+use rfq_core::types::{Dur, Ts};
 
 /// The escrow contract, as a local mock.
 ///
@@ -23,7 +23,7 @@ use rfq_core::types::Ts;
 #[derive(Debug)]
 pub struct Custody<C: Clock> {
     clock: C,
-    withdrawal_delay: Ts,
+    withdrawal_delay: Dur,
 }
 
 impl<C: Clock> Custody<C> {
@@ -34,7 +34,7 @@ impl<C: Clock> Custody<C> {
     /// may carry. The four-term inequality that relates this delay to the engine's quote
     /// lifetime spans both systems and is therefore asserted once, at startup, by whatever
     /// constructs them both (SPEC §9.3).
-    pub const fn new(clock: C, withdrawal_delay: Ts) -> Self {
+    pub const fn new(clock: C, withdrawal_delay: Dur) -> Self {
         Self { clock, withdrawal_delay }
     }
 
@@ -43,8 +43,9 @@ impl<C: Clock> Custody<C> {
         self.clock.now()
     }
 
-    /// How long `RequestWithdrawal` waits before execution (SPEC §9.3).
-    pub const fn withdrawal_delay(&self) -> Ts {
+    /// How long `RequestWithdrawal` waits before execution (SPEC §9.3). A duration, and
+    /// the one custody term of the four-term inequality.
+    pub const fn withdrawal_delay(&self) -> Dur {
         self.withdrawal_delay
     }
 

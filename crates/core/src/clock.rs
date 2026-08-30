@@ -10,7 +10,7 @@
 //! property the design must expose, so it is representable from S0 rather than retrofitted.
 //! Neither clock can read the other; only the harness (SPEC §13.1) advances both.
 
-use crate::types::Ts;
+use crate::types::{Dur, Ts};
 
 /// A source of the current time, in milliseconds (SPEC §4.0).
 ///
@@ -41,7 +41,10 @@ impl TestClock {
     }
 
     /// Move the clock forward by `duration`, clamped at the end of time.
-    pub const fn advance(&mut self, duration: Ts) {
+    ///
+    /// Takes a [`Dur`], not a [`Ts`]: advancing a clock *by an instant* is the confusion
+    /// SPEC §4.0's two types exist to make unsayable.
+    pub const fn advance(&mut self, duration: Dur) {
         self.now = self.now.saturating_add(duration);
     }
 
