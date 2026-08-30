@@ -11,7 +11,11 @@
 //! [`Harness`]: harness::Harness
 
 pub mod clock;
+pub mod event_ring;
 pub mod harness;
+pub mod venue;
 
 pub use clock::MonotonicClock;
+pub use event_ring::{EventRing, SequencedEvent};
 pub use harness::Harness;
+pub use venue::{EventSink, LogEntry, NullSink, RoundOutcome, RuntimeCapacities, Venue, replay};

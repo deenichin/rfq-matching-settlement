@@ -64,6 +64,10 @@ Nothing depends on `scenarios`.
 - `Clock` trait + `TestClock` (settable) + `MonotonicClock`. **Custody gets its own
   instance** (SPEC §9.1) — two clocks from the start, offsettable in tests
 - Slab: preallocated, free list, **generation-counted `u32` handles**
+- Slab capacities (`max_accounts`, `max_reservations`, `max_requests`, `max_quotes`) are
+  **configured**, per SPEC §3, with `CapacityTooLarge` rejecting `u32::MAX` since that value
+  is the nil chain link. Size them below `max_requests + max_quotes` deliberately, so
+  `SlabExhausted` stays a reachable rejection rather than a theoretical one (CLAUDE 39)
 - `MAX_LEGS`, `MAX_QUOTES_PER_LEG`, `MAX_QUOTE_TTL`, `MAX_REQUEST_TTL`, `MIN_HORIZON`,
   `MAX_SETTLING_TIME`, `STALL_GRACE` and the four §9.3 timelock terms as **injectable
   config**, not hard constants. Two startup assertions: the four-term timelock inequality,
@@ -107,6 +111,11 @@ start.
   live entry. The sole reclamation mechanism
 - `reserve()`, `release()` (O(1) unlink), `commit()` (unlink from expiry chain, link into
   the request's committed list, in one step), `free(acct, now)`
+- `ClaimLinks` as an **enum** (SPEC §3): a committed claim has no `expires_at` field, so
+  `release_expired` cannot be written against it. No committed guard in the traversal
+- `close_quote` / `close_request`, refusing with `OwnerStillClaimed` while capital is
+  claimed. Invariant 3's reverse direction is only meaningful where an owner can stop
+  existing
 - Normalisation emits **no events** (SPEC §4.3) — it is unbounded in count and runs before
   the CHECK phase can verify event-buffer headroom
 
@@ -114,6 +123,8 @@ start.
 invariants 1 (chain integrity) and 2 (normalisation). These are the two forms the old single
 invariant collapsed into; asserting a global expiry predicate against a stored total is
 unsatisfiable and must not be attempted (CLAUDE 16).
+Assert invariant 3 in **both** directions (SPEC §15.3) — the forward walk cannot see an
+owner still pointing at a released claim.
 Explicit tests: (a) after `release_expired`, no expired entry remains on the chain, and
 `account.reserved` equals the chain sum; (b) a reservation expiring at exactly `now` is
 reclaimed, not deferred; (c) a stale `ResIdx` from a freed slot is rejected by generation

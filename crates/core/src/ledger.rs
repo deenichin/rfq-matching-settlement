@@ -116,10 +116,17 @@ pub enum InvariantViolation {
     ClaimNotOnExactlyOneChain,
     /// §15.2 — a claim with `expires_at <= now` survived normalisation of its account.
     ExpiredClaimAfterNormalisation(AccountIdx),
+    /// §15.6 — the mirrored balance no longer covers the claims against it. The engine has
+    /// promised capital custody does not hold.
+    ClaimCoverageBroken(AccountIdx),
 }
 
 /// The engine's claim ledger.
-#[derive(Debug)]
+///
+/// `PartialEq` is structural, down to slab generations and free-list order, so replaying a
+/// command log through a fresh ledger and comparing is the byte-for-byte assertion SPEC §13
+/// asks for rather than a summary that could agree by coincidence.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Ledger {
     accounts: Vec<MirroredBalance>,
     reservations: Slab<Reservation>,
@@ -307,35 +314,16 @@ impl Ledger {
         owner: ResOwner,
     ) -> Result<ResIdx, LedgerError> {
         // ── PLAN / CHECK ──
-        let entry = self.accounts.get(account.0 as usize).ok_or(LedgerError::UnknownAccount)?;
-
-        match owner {
-            ResOwner::Quote(quote) => {
-                let held = self.quotes.get(quote).ok_or(LedgerError::StaleOwner)?.claim();
-                if held.is_some() {
-                    return Err(LedgerError::OwnerAlreadyClaimed);
-                }
-            }
+        let held = match owner {
+            ResOwner::Quote(quote) => self.quotes.get(quote).ok_or(LedgerError::StaleOwner)?.claim(),
             ResOwner::Request(request) => {
-                let held = self.requests.get(request).ok_or(LedgerError::StaleOwner)?.claim();
-                if held.is_some() {
-                    return Err(LedgerError::OwnerAlreadyClaimed);
-                }
+                self.requests.get(request).ok_or(LedgerError::StaleOwner)?.claim()
             }
+        };
+        if held.is_some() {
+            return Err(LedgerError::OwnerAlreadyClaimed);
         }
-
-        // Claim coverage (§15.6), checked against the mirror before the claim exists rather
-        // than asserted after it. Reserving moves no money — `free` is untouched — so the
-        // question is whether the claims *together* still fit inside the mirrored balance.
-        let claimed = entry
-            .reserved()
-            .checked_add(entry.committed())
-            .and_then(|total| total.checked_add(amount))
-            .ok_or(LedgerError::AmountOverflow)?;
-        if claimed > entry.free() {
-            return Err(LedgerError::InsufficientFree);
-        }
-        let reserved = entry.reserved().checked_add(amount).ok_or(LedgerError::AmountOverflow)?;
+        let reserved = self.check_reservable(account, amount)?;
 
         // Last CHECK-phase step. It is fallible and it takes a slot, but a *failed* insert
         // mutates nothing — the slab does not grow, it refuses (CLAUDE 10) — so a rejection
@@ -347,14 +335,135 @@ impl Ledger {
             .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Reservation })?;
 
         // ── COMMIT ──
+        self.link_claim(account, claim, expires_at, owner, reserved);
+        self.assert_invariants();
+        Ok(claim)
+    }
+
+    /// Open a quote and reserve against it in one command.
+    ///
+    /// Two slabs and a balance move together or not at all. Doing it as two ledger calls
+    /// would leave a quote slot taken when the reservation is refused, which is a partially
+    /// applied command (CLAUDE 19) — so both slabs are checked for room *before* either
+    /// insert, and neither insert can then fail.
+    ///
+    /// This is the shape S2's `SubmitQuote` needs; S2 adds price, size and the per-leg
+    /// chain on top of it.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::UnknownAccount`], [`LedgerError::InsufficientFree`],
+    /// [`LedgerError::AmountOverflow`], [`LedgerError::SlabExhausted`].
+    pub fn open_quote_reserving(
+        &mut self,
+        account: AccountIdx,
+        amount: Amount,
+        expires_at: Ts,
+    ) -> Result<(QuoteIdx, ResIdx), LedgerError> {
+        // ── PLAN / CHECK ──
+        let reserved = self.check_reservable(account, amount)?;
+        if !self.quotes.has_room() {
+            return Err(LedgerError::SlabExhausted { slab: SlabKind::Quote });
+        }
+        if !self.reservations.has_room() {
+            return Err(LedgerError::SlabExhausted { slab: SlabKind::Reservation });
+        }
+
+        // Both slabs were just shown to have room and nothing between here and the inserts
+        // consumes a slot, so neither `?` can fire. They are written fallibly because
+        // `insert` is; a failure would mean `has_room` lied, which the slab's own debug
+        // assertions catch.
+        let quote = self
+            .quotes
+            .insert(Quote::new())
+            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Quote })?;
+        let owner = ResOwner::Quote(quote);
+        let claim = self
+            .reservations
+            .insert(Reservation::reserved(account, amount, owner, expires_at))
+            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Reservation })?;
+
+        // ── COMMIT ──
+        self.link_claim(account, claim, expires_at, owner, reserved);
+        self.assert_invariants();
+        Ok((quote, claim))
+    }
+
+    /// Open a request and reserve the requester's claim against it in one command.
+    ///
+    /// The requester's `Σ size × limit_price` is reserved at `SubmitRequest`, before any
+    /// price exists (§5.2), which is why this is one operation and not two.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::open_quote_reserving`].
+    pub fn open_request_reserving(
+        &mut self,
+        account: AccountIdx,
+        amount: Amount,
+        expires_at: Ts,
+    ) -> Result<(ReqIdx, ResIdx), LedgerError> {
+        // ── PLAN / CHECK ──
+        let reserved = self.check_reservable(account, amount)?;
+        if !self.requests.has_room() {
+            return Err(LedgerError::SlabExhausted { slab: SlabKind::Request });
+        }
+        if !self.reservations.has_room() {
+            return Err(LedgerError::SlabExhausted { slab: SlabKind::Reservation });
+        }
+
+        let request = self
+            .requests
+            .insert(Request::new())
+            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Request })?;
+        let owner = ResOwner::Request(request);
+        let claim = self
+            .reservations
+            .insert(Reservation::reserved(account, amount, owner, expires_at))
+            .map_err(|_| LedgerError::SlabExhausted { slab: SlabKind::Reservation })?;
+
+        // ── COMMIT ──
+        self.link_claim(account, claim, expires_at, owner, reserved);
+        self.assert_invariants();
+        Ok((request, claim))
+    }
+
+    /// Claim coverage (§15.6), checked against the mirror before the claim exists rather
+    /// than asserted after it. Reserving moves no money — `free` is untouched — so the
+    /// question is whether the claims *together* still fit inside the mirrored balance.
+    ///
+    /// Returns what `account.reserved` becomes if the claim is admitted.
+    fn check_reservable(
+        &self,
+        account: AccountIdx,
+        amount: Amount,
+    ) -> Result<Amount, LedgerError> {
+        let entry = self.accounts.get(account.0 as usize).ok_or(LedgerError::UnknownAccount)?;
+        let claimed = entry
+            .reserved()
+            .checked_add(entry.committed())
+            .and_then(|total| total.checked_add(amount))
+            .ok_or(LedgerError::AmountOverflow)?;
+        if claimed > entry.free() {
+            return Err(LedgerError::InsufficientFree);
+        }
+        entry.reserved().checked_add(amount).ok_or(LedgerError::AmountOverflow)
+    }
+
+    /// The infallible tail every reservation path shares.
+    fn link_claim(
+        &mut self,
+        account: AccountIdx,
+        claim: ResIdx,
+        expires_at: Ts,
+        owner: ResOwner,
+        reserved: Amount,
+    ) {
         self.link_into_expiry_chain(account, claim.index(), expires_at);
         if let Some(entry) = self.accounts.get_mut(account.0 as usize) {
             entry.set_reserved(reserved);
         }
         self.set_owner_claim(owner, Some(claim));
-
-        self.assert_invariants();
-        Ok(claim)
     }
 
     /// Release a named claim, returning the amount freed.
@@ -871,6 +980,31 @@ impl Ledger {
             }
         }
 
+        Ok(())
+    }
+
+    /// §15.6 — claim coverage: `∀ a: free(a) ≥ reserved(a) + committed(a)`.
+    ///
+    /// Against the **mirror**, because that is all the engine can see: the authoritative
+    /// form compares against `custody.free(a)` and spans both systems, so it belongs to the
+    /// harness once custody has balances (§2.2, §13.1). The mirror form is what the engine
+    /// admits against, and `reserve` maintains it structurally — a violation here would mean
+    /// a claim was created without passing `check_reservable`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvariantViolation::ClaimCoverageBroken`] naming the account.
+    pub fn check_claim_coverage(&self) -> Result<(), InvariantViolation> {
+        for (index, entry) in self.accounts.iter().enumerate() {
+            let account = AccountIdx(u32::try_from(index).unwrap_or(u32::MAX));
+            let claimed = entry
+                .reserved()
+                .checked_add(entry.committed())
+                .ok_or(InvariantViolation::ClaimCoverageBroken(account))?;
+            if claimed > entry.free() {
+                return Err(InvariantViolation::ClaimCoverageBroken(account));
+            }
+        }
         Ok(())
     }
 

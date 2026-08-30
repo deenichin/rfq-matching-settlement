@@ -66,3 +66,47 @@ impl Clock for TestClock {
         self.now
     }
 }
+
+/// A clock that advances one step **on every read**.
+///
+/// CLAUDE 40: a round that completes inside one millisecond samples the same `now`
+/// throughout, so normalisation never fires and every time-dependent path goes untested
+/// while the suite stays green. A clock that moves per read makes each command land at a
+/// distinct instant, which is what forces claims to expire mid-round.
+///
+/// It reads no wall clock and is still monotonic, so it is a legitimate `Clock` and not a
+/// test fixture pretending to be one. The shipping [`MonotonicClock`] is run over the same
+/// scenario separately, to prove the wiring rather than the logic.
+///
+/// `Cell` rather than an atomic: this clock is read by the single engine thread, and a
+/// clock shared between writers would be a second source of nondeterminism.
+///
+/// [`MonotonicClock`]: https://docs.rs/
+#[derive(Debug)]
+pub struct TickClock {
+    next: core::cell::Cell<Ts>,
+    step: Dur,
+}
+
+impl TickClock {
+    /// A clock whose first read returns `start` and whose every read afterwards is `step`
+    /// later than the last.
+    #[must_use]
+    pub const fn new(start: Ts, step: Dur) -> Self {
+        Self { next: core::cell::Cell::new(start), step }
+    }
+
+    /// How many steps this clock has been read for.
+    #[must_use]
+    pub fn reads(&self, start: Ts) -> u64 {
+        self.next.get().0.saturating_sub(start.0).checked_div(self.step.0.max(1)).unwrap_or(0)
+    }
+}
+
+impl Clock for TickClock {
+    fn now(&self) -> Ts {
+        let now = self.next.get();
+        self.next.set(now.saturating_add(self.step));
+        now
+    }
+}

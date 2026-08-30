@@ -289,17 +289,38 @@ struct Reservation {
 }
 ```
 
-**Two chains, never both.** A reservation is linked into exactly one:
+**Two chains, never both — and the type says so.** `ClaimLinks` is an enum, not a struct
+with a flag:
 
-| While | Linked into | Ordered by |
-|---|---|---|
-| `reserved` | the account's expiry chain | `expires_at` |
-| `committed` | the request's committed list | insertion |
+```rust
+enum ClaimLinks {
+    Reserved  { expires_at: Ts, prev: Link, next: Link },   // account's expiry chain
+    Committed { request: ReqIdx, prev: Link, next: Link },  // request's committed list
+}
+```
+
+A committed claim has **no `expires_at` field at all**. `release_expired` walks the expiry
+chain and evaluates an expiry predicate, and neither operation can be written against a
+committed claim — the impossibility is in the type, not in a guard. There is no committed
+check in `release_expired` and none is needed. That is what makes §2.4's "may not be released
+on a guess" structurally true rather than asserted.
+
+| While | Linked into | Ordered by | Has a tail |
+|---|---|---|---|
+| `reserved` | the account's expiry chain | `expires_at`, ascending | yes — insertion walks back from it |
+| `committed` | the request's committed list | insertion | no — nothing asks it for an earliest element |
 
 The commit phase (§7.2) unlinks from the first and links into the second in one step.
-`committed` entries have no expiry and are therefore unreachable by `release_expired`,
-which is what makes §2.4's "may not be released on a guess" structurally true rather than
-merely stated. `account.committed` is a second stored total alongside `account.reserved`.
+`account.committed` is a second stored total alongside `account.reserved`.
+
+**Chain links carry no generation; owner references do.** A link the ledger maintains itself
+cannot be stale — it is only ever written by the code that owns both ends. A cross-structure
+reference genuinely can be, so `ResOwner` carries a generation and is checked on dereference.
+Links are bare `u32` with `u32::MAX` as the nil sentinel; note that `derive(Default)` would
+make nil be `0`, i.e. a valid slot, so a fresh chain would appear populated.
+
+Chain walks are bounded by slab capacity, so a broken unlink surfaces as a failed assertion
+rather than a hang.
 
 **Release-on-access is the only mechanism, and it is the correctness path.** Any command
 touching account A first runs `release_expired(A, now)`, which walks A's chain from the head
@@ -1224,15 +1245,24 @@ previous single blanket claim was false for two of them.
    `account.reserved` is a stored value while an expiry predicate shrinks with the passage
    of time alone — asserting the predicate form globally would be unsatisfiable for any
    untouched account, and is the form CLAUDE rule 16 must **not** use.
-3. **Reservation/quote coherence.** Every claim's `owner` **must resolve**, and the
-   resolved target must point back at the claim. A `reserved` entry references a standing
-   quote; a `committed` entry references either exactly one `Consumed` quote on a request in
-   `Settling`, or that request itself (the requester side) — §2.4.
+3. **Reservation/owner coherence, asserted in BOTH directions.** A `reserved` entry
+   references a standing quote; a `committed` entry references either exactly one `Consumed`
+   quote on a request in `Settling`, or that request itself (the requester side) — §2.4.
 
-   The "must resolve" half is load-bearing. If a failed dereference is treated as *nothing
-   to check*, a claim naming a slot that has been freed and reissued passes silently — which
-   is precisely the stale-handle class that generation counters exist to catch, and the
-   assertion would be blind to the one case it is for.
+   *Forward*: every claim's `owner` **must resolve**, and the resolved target must point back
+   at the claim. If a failed dereference is treated as *nothing to check*, a claim naming a
+   freed and reissued slot passes silently — precisely the stale-handle class generation
+   counters exist to catch, leaving the assertion blind to the one case it is for.
+
+   *Reverse*: iterate every owner holding a claim and check the claim is live. The forward
+   direction cannot see an owner left pointing at a claim that has been released, because the
+   freed claim is no longer iterated — there is nothing to look at. **A bidirectional
+   invariant asserted in one direction is half an invariant.**
+
+   Owners must therefore be closable: `close_quote` / `close_request` refuse with
+   `OwnerStillClaimed` while capital is claimed, and a request holding committed capital
+   cannot be closed at all. "The owner must resolve" is only meaningful where an owner can
+   stop existing.
 4. **No mutation on rejection.** A rejected command leaves state byte-identical **to the
    post-normalisation state** (§4.3), checked by a test-only state hash taken after
    normalisation and again after the command. Normalisation is time catching up and is not

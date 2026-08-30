@@ -76,20 +76,25 @@ pub struct SlabFull;
 
 /// What a slot holds. A vacant slot carries the free-list link in place of its value, so
 /// the free list costs no storage of its own.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum SlotState<T> {
     Vacant { next: u32 },
     Occupied(T),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Slot<T> {
     generation: u32,
     state: SlotState<T>,
 }
 
 /// A preallocated, generation-counted slab with an intrusive free list.
-#[derive(Debug)]
+///
+/// `PartialEq` is structural and covers the generation counters and the free-list order as
+/// well as the contents. That is what makes "replay reproduces the final state
+/// byte-for-byte" (SPEC §13) an assertion rather than a slogan: two slabs holding the same
+/// values in different slots, or the same values with different generations, are not equal.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Slab<T> {
     slots: Vec<Slot<T>>,
     free_head: u32,
@@ -124,6 +129,15 @@ impl<T> Slab<T> {
     pub fn capacity(&self) -> u32 {
         // `slots` is filled once in `with_capacity` and neither pushed to nor truncated.
         u32::try_from(self.slots.len()).unwrap_or(NIL)
+    }
+
+    /// Whether a free slot exists.
+    ///
+    /// Lets a caller that must insert into two slabs atomically do both checks *before*
+    /// either insert, so neither can fail once the first has happened (CLAUDE 18, 19).
+    #[must_use]
+    pub const fn has_room(&self) -> bool {
+        self.free_head != NIL
     }
 
     /// Occupied slots.

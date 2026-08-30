@@ -33,7 +33,7 @@ pub use clock::{Clock, TestClock};
 pub use command::Command;
 pub use config::{Config, ConfigError, MAX_LEGS, MAX_QUOTES_PER_LEG};
 pub use engine::Engine;
-pub use event::Event;
+pub use event::{Event, EventBuffer, EventBufferFull};
 pub use ledger::{InvariantViolation, Ledger, LedgerError, SlabKind};
 pub use quote::{Quote, QuoteIdx};
 pub use request::{ReqIdx, Request};
