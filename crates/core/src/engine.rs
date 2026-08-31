@@ -292,7 +292,8 @@ impl Engine {
     ///
     /// Derived from the command's *addressing*, not from whether it will succeed. Returns a
     /// fixed-size array so nothing allocates; unused slots are `None`.
-    fn touched_accounts(&self, command: Command) -> [Option<AccountIdx>; 2] {
+    #[must_use]
+    pub fn touched_accounts(&self, command: Command) -> [Option<AccountIdx>; 2] {
         let mut touched: [Option<AccountIdx>; 2] = [None, None];
         match command {
             Command::CreditAccount { account, .. } => touched[0] = Some(account),

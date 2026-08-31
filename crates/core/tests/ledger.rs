@@ -18,7 +18,7 @@
 use rfq_core::account::AccountIdx;
 use rfq_core::config::{Config, MAX_LEGS};
 use rfq_core::contract::ContractIdx;
-use rfq_core::ledger::{Ledger, LedgerError, SlabKind};
+use rfq_core::ledger::{InvariantViolation, Ledger, LedgerError, SlabKind};
 use rfq_core::quote::{Quote, QuoteIdx};
 use rfq_core::request::{Leg, ReqIdx, Request};
 use rfq_core::reservation::ResOwner;
@@ -311,6 +311,64 @@ fn a_claim_beyond_the_mirrored_balance_is_refused() {
     assert_eq!(ledger.reservation_count(), 1);
     assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(100));
     assert!(ledger.quote(quote_of(second)).unwrap().claim().is_none());
+    assert_eq!(ledger.check_structural_invariants(), Ok(()));
+}
+
+#[test]
+fn the_scoped_coverage_check_answers_for_one_account_and_agrees_with_the_whole_table() {
+    // The per-command form. A command addresses at most two accounts, so scanning every
+    // preallocated row to check them is work proportional to the venue rather than to the
+    // command — the argument `check_normalised` already makes for itself.
+    let mut ledger = ledger(100);
+    let owner = quote_owner(&mut ledger);
+    ledger.reserve(ALICE, Amount(60), Ts(1_000), owner).unwrap();
+
+    assert_eq!(ledger.check_claim_coverage_for(ALICE), Ok(()));
+    assert_eq!(ledger.check_claim_coverage_for(BOB), Ok(()), "an untouched account is covered");
+    assert_eq!(ledger.check_claim_coverage(), Ok(()), "and the whole table agrees");
+}
+
+#[test]
+fn a_mirror_that_drops_below_its_claims_breaks_coverage_without_any_claim_being_made() {
+    // Admission cannot break coverage — `a_claim_beyond_the_mirrored_balance_is_refused`
+    // shows the guard. The *other* writer of `free` can: `apply_mirror_update` takes
+    // custody's availability verbatim, and requesting a withdrawal drops availability the
+    // instant it is asked for, before any money moves (§15.7).
+    //
+    // So this predicate is a post-condition of admission and **not** an invariant that holds
+    // through a mirror update. Asserting it there would fail on a correct system, which
+    // CLAUDE 41 names as worse than not asserting at all — and it is why the venue's
+    // per-command assertion skips `CreditAccount`. The unconditional form compares against
+    // balance plus locked escrow contributions and spans both systems, so it is the
+    // harness's (SPEC §15, §13.1).
+    //
+    // Both halves of `claimed` are exercised: one claim left reserved and one committed, so
+    // a check that summed only the reserved side would pass here and must not.
+    let mut ledger = ledger(100);
+    let still_reserved = quote_owner(&mut ledger);
+    let to_commit = quote_owner(&mut ledger);
+    let request = bare_request(&mut ledger);
+    ledger.reserve(ALICE, Amount(40), Ts(1_000), still_reserved).unwrap();
+    let claim = ledger.reserve(ALICE, Amount(60), Ts(2_000), to_commit).unwrap();
+    ledger.commit(claim, request).unwrap();
+    assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(40));
+    assert_eq!(ledger.account(ALICE).unwrap().committed(), Amount(60));
+    assert_eq!(ledger.check_claim_coverage_for(ALICE), Ok(()));
+
+    // The chain says Alice's availability is now 50: she asked for 50 back. That is below
+    // the 100 she has claimed, but *above* the 40 still merely reserved — so only a check
+    // that counts committed capital too can see it.
+    ledger.apply_mirror_update(ALICE, Amount(50)).unwrap();
+
+    assert_eq!(
+        ledger.check_claim_coverage_for(ALICE),
+        Err(InvariantViolation::ClaimCoverageBroken(ALICE)),
+        "the claim outlives the availability backing it, which §9.3's timelock makes safe \
+         rather than prevents"
+    );
+    // Nothing is wrong with the ledger itself — the claims are intact and the chains sound.
+    assert_eq!(ledger.account(ALICE).unwrap().reserved(), Amount(40));
+    assert_eq!(ledger.account(ALICE).unwrap().committed(), Amount(60));
     assert_eq!(ledger.check_structural_invariants(), Ok(()));
 }
 

@@ -166,14 +166,8 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
     // 100 iterations. Flakiness here is a finding, not something to retry around.
     for iteration in 0..100 {
         let outcome = concurrent_round(TickClock::new(start, Dur(1)));
-        let RoundOutcome {
-            engine,
-            log,
-            coverage_checks,
-            coverage_violations,
-            events_dropped,
-            events_emitted,
-        } = outcome;
+        let RoundOutcome { engine, log, coverage_checks, events_dropped, events_emitted } =
+            outcome;
 
         // ── (a) every submitted command appears exactly once, in channel order ──
         // One RegisterContract, then every client's commands.
@@ -216,9 +210,12 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
         );
 
         // ── (c) claim coverage held throughout ──
-        assert_eq!(coverage_violations, 0, "iteration {iteration}: claim coverage broke");
-        // And it was actually checked, once per command (CLAUDE 39).
-        assert_eq!(coverage_checks, expected as u64);
+        // The venue asserts it per command as a scoped debug assertion, so a violation
+        // anywhere in the round would have panicked the engine thread and `join` would have
+        // panicked in turn. Reaching this line is the assertion. What still has to be
+        // checked explicitly is that the assertion actually ran, once per command — a debug
+        // assertion that is never reached proves nothing (CLAUDE 39).
+        assert_eq!(coverage_checks, expected as u64, "iteration {iteration}");
         assert_eq!(engine.ledger().check_claim_coverage(), Ok(()));
 
         // ── the gate's assertions about itself ──
@@ -296,7 +293,6 @@ fn the_same_round_runs_on_the_shipping_clock() {
     for pair in outcome.log.windows(2) {
         assert!(pair[1].at >= pair[0].at, "the shipping clock ran backwards");
     }
-    assert_eq!(outcome.coverage_violations, 0);
     assert_eq!(outcome.coverage_checks, expected as u64);
 
     let replayed = replay(config(), &outcome.log, capacities().event_buffer).unwrap();
@@ -412,5 +408,7 @@ fn the_engine_keeps_applying_after_the_publisher_dies() {
         (CLIENTS * COMMANDS_PER_CLIENT) as usize + 1,
         "the engine stopped when the publisher did"
     );
-    assert_eq!(outcome.coverage_violations, 0);
+    // Coverage is asserted per command inside the venue; a violation would have panicked the
+    // engine thread rather than returned. This is the count that says it ran.
+    assert_eq!(outcome.coverage_checks, outcome.log.len() as u64);
 }

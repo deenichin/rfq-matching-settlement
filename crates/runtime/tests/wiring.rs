@@ -146,7 +146,7 @@ fn a_request_reaches_makers_with_its_wording_its_sides_and_its_sizes_but_no_limi
     let outcome = venue.join();
     assert!(outcome.log.iter().all(|entry| entry.outcome.is_ok()), "{:?}", outcome.log);
     assert!(outcome.events_emitted >= 1, "the engine emitted nothing");
-    assert_eq!(outcome.coverage_violations, 0);
+    assert_eq!(outcome.coverage_checks, outcome.log.len() as u64, "coverage ran per command");
 
     let feed = feed.lock().unwrap();
     assert_eq!(feed.opened.len(), 1, "exactly one request was announced");

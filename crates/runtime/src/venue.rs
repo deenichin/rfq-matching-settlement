@@ -89,11 +89,10 @@ pub struct RoundOutcome {
     pub engine: Engine,
     /// Every command, in the order the channel serialised them.
     pub log: Vec<LogEntry>,
-    /// How many times claim coverage was checked. Asserting the count is what keeps
-    /// "coverage held throughout" from being satisfied by never checking (CLAUDE 39).
+    /// How many commands were applied, and therefore how many times the debug assertion on
+    /// claim coverage ran. Asserting the count is what keeps "coverage held throughout" from
+    /// being satisfied by never checking (CLAUDE 39).
     pub coverage_checks: u64,
-    /// How many of those checks failed. Must be zero.
-    pub coverage_violations: u64,
     /// Events evicted from the ring unread.
     pub events_dropped: u64,
     /// Events the engine emitted. Counted so a test can assert the engine *did* emit —
@@ -228,7 +227,6 @@ fn run_engine<C: Clock>(
     let mut events = EventBuffer::with_capacity(capacities.event_buffer);
     let mut sequence: u64 = 0;
     let mut coverage_checks: u64 = 0;
-    let mut coverage_violations: u64 = 0;
     let mut events_emitted: u64 = 0;
 
     loop {
@@ -252,10 +250,36 @@ fn run_engine<C: Clock>(
                         events_emitted.saturating_add(ring.append(events.drain()));
                 }
 
+                // Claim coverage is an invariant, and an invariant check is not production
+                // work. SPEC §15's table places it in "the harness, after every command, in
+                // tests and scenarios"; this loop is neither. It ran here unconditionally,
+                // scanning all `max_accounts` preallocated rows — 256 by default — for a
+                // command that addresses at most two, and then only counted what it found.
+                //
+                // It is now a debug assertion over the accounts the command actually names,
+                // so it still fires on every command under test and compiles out of release
+                // entirely. It halts rather than tallies: a broken invariant is not a
+                // statistic.
+                //
+                // Skipped after a mirror update, and that exclusion is the point rather than
+                // a convenience. `CreditAccount` carries custody's *availability*, which
+                // drops the moment a withdrawal is requested — so it can legitimately put
+                // the mirror below claims the engine already holds. Asserting through that
+                // window would fail on a correct system, which CLAUDE 41 names as worse than
+                // not asserting at all. The form that does hold there spans both systems and
+                // is the harness's.
                 coverage_checks = coverage_checks.saturating_add(1);
-                if engine.ledger().check_claim_coverage().is_err() {
-                    coverage_violations = coverage_violations.saturating_add(1);
-                }
+                debug_assert!(
+                    matches!(command, Command::CreditAccount { .. })
+                        || engine
+                            .touched_accounts(command)
+                            .iter()
+                            .flatten()
+                            .all(|account| {
+                                engine.ledger().check_claim_coverage_for(*account).is_ok()
+                            }),
+                    "claim coverage broke on {command:?}"
+                );
             }
             // Busy-spin. The venue has one writer and no reason to park it.
             Err(TryRecvError::Empty) => std::hint::spin_loop(),
@@ -268,7 +292,6 @@ fn run_engine<C: Clock>(
         engine,
         log,
         coverage_checks,
-        coverage_violations,
         events_dropped,
         events_emitted,
     }

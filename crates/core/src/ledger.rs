@@ -1348,6 +1348,42 @@ impl Ledger {
         Ok(())
     }
 
+    /// §15.6 for **one account**, which is the only form worth evaluating per command.
+    ///
+    /// A command addresses at most two accounts ([`Engine::touched_accounts`]), so scanning
+    /// the whole preallocated table to check them is work proportional to the venue rather
+    /// than to the command. `check_normalised` already scopes itself for the same reason and
+    /// says so; this is that argument applied to the other half.
+    ///
+    /// **This predicate is not unconditional, and the caller must know when it holds.** It
+    /// compares claims against the *mirror*, which projects custody's **availability** —
+    /// balance minus pending withdrawals (§15.7). Requesting a withdrawal drops availability
+    /// immediately, so a `CreditAccount` carrying that drop can legitimately push the mirror
+    /// below claims the engine already holds; §9.3's timelock is what makes that window safe
+    /// rather than what prevents it. So this holds as a post-condition of *admission*, and
+    /// not after a mirror update. The unconditional form spans both systems — balance plus
+    /// locked escrow contributions — and lives in the harness, where §15's table puts it.
+    ///
+    /// # Errors
+    ///
+    /// [`InvariantViolation::ClaimCoverageBroken`].
+    ///
+    /// [`Engine::touched_accounts`]: crate::engine::Engine::touched_accounts
+    pub fn check_claim_coverage_for(
+        &self,
+        account: AccountIdx,
+    ) -> Result<(), InvariantViolation> {
+        let Some(entry) = self.accounts.get(account.0 as usize) else { return Ok(()) };
+        let claimed = entry
+            .reserved()
+            .checked_add(entry.committed())
+            .ok_or(InvariantViolation::ClaimCoverageBroken(account))?;
+        if claimed > entry.free() {
+            return Err(InvariantViolation::ClaimCoverageBroken(account));
+        }
+        Ok(())
+    }
+
     /// §15.6 — claim coverage: `∀ a: free(a) ≥ reserved(a) + committed(a)`.
     ///
     /// Against the **mirror**, because that is all the engine can see: the authoritative
@@ -1359,6 +1395,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`InvariantViolation::ClaimCoverageBroken`] naming the account.
+    ///
+    /// Whole-table, so this is a **test and scenario** query — see
+    /// [`check_claim_coverage_for`](Self::check_claim_coverage_for) for the per-command form.
     pub fn check_claim_coverage(&self) -> Result<(), InvariantViolation> {
         for (index, entry) in self.accounts.iter().enumerate() {
             let account = AccountIdx(u32::try_from(index).unwrap_or(u32::MAX));
