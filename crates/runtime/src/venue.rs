@@ -104,9 +104,20 @@ pub struct RoundOutcome {
 #[derive(Debug)]
 pub struct Venue {
     commands: SyncSender<Command>,
-    engine_thread: JoinHandle<RoundOutcome>,
+    engine_thread: JoinHandle<EngineRound>,
     publisher_thread: JoinHandle<()>,
+    logger_thread: JoinHandle<Vec<LogEntry>>,
     ring: Arc<SharedRing<Event>>,
+}
+
+/// What the engine thread returns. The command log is not part of it: the engine hands
+/// entries to the logger and never owns the growing collection (see [`run_logger`]).
+#[derive(Debug)]
+struct EngineRound {
+    engine: Engine,
+    coverage_checks: u64,
+    events_dropped: u64,
+    events_emitted: u64,
 }
 
 /// How large the runtime's preallocated structures are.
@@ -159,13 +170,37 @@ impl Venue {
         let (commands, inbox) = mpsc::sync_channel::<Command>(capacities.command_channel);
         let ring = Arc::new(SharedRing::with_capacity(capacities.event_ring));
 
+        // Unbounded, and deliberately: a bounded log channel would either stall the engine
+        // when full — the one thing SPEC §13 forbids — or drop entries, which breaks the
+        // replay the log exists for. Unbounded moves the growth to a thread that is not
+        // latency-critical, and costs the engine one small constant-size send per command
+        // instead of an occasional quarter-megabyte reallocation.
+        //
+        // **This is a small improvement, and it is worth being exact about how small.** It
+        // changes the shape of the allocation rather than removing it. An unbounded channel
+        // has to allocate to hold an arbitrary number of entries, so a send is a slot write
+        // plus a block allocation every few dozen commands. What it buys is that the worst
+        // single command is now one small block instead of a reallocate-and-copy of the
+        // whole log — bounded rather than proportional to how long the venue has been up —
+        // and that the unbounded growth belongs to a thread with nothing to be late for.
+        // The mean cost went slightly *up*: an atomic and an amortised malloc where there
+        // used to be a bare memcpy into a preallocated slot. That trade is right for a
+        // writer whose tail matters, and it is not the same claim as allocation-free.
+        //
+        // See `run_logger` for what allocation-free would actually take.
+        let (entries, journal) = mpsc::channel::<LogEntry>();
+        let logger_thread = thread::Builder::new()
+            .name("logger".to_owned())
+            .spawn(move || run_logger(&journal, capacities.command_log))
+            .unwrap_or_else(|error| panic!("the logger thread must start: {error}"));
+
         let engine_ring = Arc::clone(&ring);
         let engine_thread = thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || {
                 // The clock is owned by this closure and therefore by the engine thread.
                 // Nothing else can read it, so there is one clock and one sample per command.
-                run_engine(engine, &clock, &inbox, &engine_ring, capacities)
+                run_engine(engine, &clock, &inbox, &engine_ring, &entries, capacities)
             })
             .unwrap_or_else(|error| panic!("the engine thread must start: {error}"));
 
@@ -175,7 +210,7 @@ impl Venue {
             .spawn(move || run_publisher(sink, &publisher_ring))
             .unwrap_or_else(|error| panic!("the publisher thread must start: {error}"));
 
-        Ok(Self { commands, engine_thread, publisher_thread, ring })
+        Ok(Self { commands, engine_thread, publisher_thread, logger_thread, ring })
     }
 
     /// A handle for a client thread to submit on. Cloneable: many producers, one consumer.
@@ -201,17 +236,26 @@ impl Venue {
     /// nothing sensible to return.
     #[must_use]
     pub fn join(self) -> RoundOutcome {
-        let Self { commands, engine_thread, publisher_thread, ring } = self;
+        let Self { commands, engine_thread, publisher_thread, logger_thread, ring } = self;
         drop(commands);
-        let outcome = engine_thread
+        let round = engine_thread
             .join()
             .unwrap_or_else(|_| panic!("the engine thread must not panic; it owns the state"));
+        // The engine dropped its sender when it returned, so the logger's channel is closed
+        // and it has already retired with the complete log.
+        let log = logger_thread.join().unwrap_or_default();
         // The publisher is asked to stop only after the engine is done, so the engine is
         // never waiting on it. A publisher that died already is joined here as an Err and
         // deliberately ignored: the audit trail is best-effort (SPEC §13).
         ring.finish();
         let _ = publisher_thread.join();
-        outcome
+        RoundOutcome {
+            engine: round.engine,
+            log,
+            coverage_checks: round.coverage_checks,
+            events_dropped: round.events_dropped,
+            events_emitted: round.events_emitted,
+        }
     }
 }
 
@@ -221,9 +265,9 @@ fn run_engine<C: Clock>(
     clock: &C,
     inbox: &mpsc::Receiver<Command>,
     ring: &SharedRing<Event>,
+    entries: &mpsc::Sender<LogEntry>,
     capacities: RuntimeCapacities,
-) -> RoundOutcome {
-    let mut log: Vec<LogEntry> = Vec::with_capacity(capacities.command_log);
+) -> EngineRound {
     let mut events = EventBuffer::with_capacity(capacities.event_buffer);
     let mut sequence: u64 = 0;
     let mut coverage_checks: u64 = 0;
@@ -238,7 +282,14 @@ fn run_engine<C: Clock>(
                 events.clear();
                 let outcome = engine.apply(command, now, &mut events);
 
-                log.push(LogEntry { sequence, at: now, command, outcome });
+                // Handed off, not accumulated. A `Vec` that grows on this thread turns one
+                // push in every capacity-doubling into a reallocate-and-copy of the whole
+                // log — amortised O(1), and a tail-latency spike exactly where the design
+                // cares about the tail. The send is constant-size and the growth belongs to
+                // a thread with nothing to be late for. A logger that has gone away is
+                // ignored: the audit trail is best-effort and the state machine is
+                // authoritative (SPEC §13).
+                let _ = entries.send(LogEntry { sequence, at: now, command, outcome });
                 sequence = sequence.saturating_add(1);
 
                 // Events move to the ring *outside* apply. The engine never touches the
@@ -288,13 +339,49 @@ fn run_engine<C: Clock>(
     }
 
     let events_dropped = ring.dropped();
-    RoundOutcome {
-        engine,
-        log,
-        coverage_checks,
-        events_dropped,
-        events_emitted,
+    EngineRound { engine, coverage_checks, events_dropped, events_emitted }
+}
+
+/// Owns the command log. Receives entries and never touches engine state.
+///
+/// The log has to be **complete** — `replay` reproduces engine state from it, and SPEC §12
+/// names roll-back-and-reapply as the recovery for a reorg deeper than the confirmation
+/// depth. A lossy log serves neither, which is why the channel is unbounded and this thread
+/// simply absorbs whatever arrives. Where it grows without limit is still a problem, but it
+/// is now a problem belonging to a thread that can page, rotate or persist without anybody
+/// waiting on it.
+///
+/// # What this would be with a dependency, or with `unsafe`
+///
+/// A genuinely allocation-free writer is reachable and this is not it. The shape is a
+/// **preallocated single-producer ring of `LogEntry` slots**: the engine writes into a slot
+/// it already owns and publishes an index, and this thread copies out and does its own
+/// growth off the hot path. That is allocation-free on the writer *and* still complete,
+/// because the growth moves rather than disappears — which is the property the channel
+/// version does not have.
+///
+/// Two things keep it out of this build. `crossbeam_queue::ArrayQueue` is the ready-made
+/// version and is a dependency (CLAUDE 36); hand-rolling the equivalent needs `UnsafeCell`
+/// for the slots, because the producer holds `&mut` to one while the consumer holds `&` to
+/// another, and safe Rust cannot express that (CLAUDE 25). In production the answer is the
+/// former — an audited, loom-tested queue rather than a bespoke one — or an in-house ring
+/// where the slot layout is chosen for the entry rather than for a generic `T`.
+///
+/// It also needs an answer for a full ring, and that answer is awkward on purpose: blocking
+/// the engine is what SPEC §13 forbids, and dropping breaks the replay the log exists for.
+/// A logger that does nothing but a memcpy will not fall behind a single writer, so the
+/// overflow branch would be a "cannot happen" that still has to be written and defended —
+/// which is its own reason to reach for a queue somebody else already argues about.
+///
+/// `crossbeam-channel` would also be the production choice for the unbounded form used
+/// here, being faster than `std`'s for the same semantics; it is excluded by the same rule.
+fn run_logger(journal: &mpsc::Receiver<LogEntry>, capacity: usize) -> Vec<LogEntry> {
+    let mut log: Vec<LogEntry> = Vec::with_capacity(capacity);
+    // Ends when the engine drops its sender, which happens when `run_engine` returns.
+    while let Ok(entry) = journal.recv() {
+        log.push(entry);
     }
+    log
 }
 
 /// Drains the ring and performs all I/O. Owns no engine state and writes none.
