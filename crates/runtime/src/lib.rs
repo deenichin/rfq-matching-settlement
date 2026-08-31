@@ -15,10 +15,12 @@ pub mod event_ring;
 pub mod gateway;
 pub mod harness;
 pub mod settlement;
+pub mod shared_ring;
 pub mod venue;
 
 pub use clock::MonotonicClock;
 pub use event_ring::{EventRing, Sequenced, SequencedEvent};
 pub use gateway::{ContractRef, ContractRegistry, Gateway, GatewayError};
 pub use harness::{CrossSystemViolation, Harness, HarnessError};
+pub use shared_ring::SharedRing;
 pub use venue::{EventSink, LogEntry, NullSink, RoundOutcome, RuntimeCapacities, Venue, replay};

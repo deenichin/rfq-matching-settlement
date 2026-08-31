@@ -30,17 +30,18 @@
 //! and the command log incomplete, which is strictly worse than losing event continuity.
 
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use rfq_core::clock::Clock;
 use rfq_core::command::Command;
 use rfq_core::config::Config;
 use rfq_core::engine::{Engine, EngineError};
-use rfq_core::event::EventBuffer;
+use rfq_core::event::{Event, EventBuffer};
 use rfq_core::types::Ts;
 
-use crate::event_ring::{EventRing, SequencedEvent};
+use crate::event_ring::SequencedEvent;
+use crate::shared_ring::SharedRing;
 
 /// One entry of the append-only command log.
 ///
@@ -106,7 +107,7 @@ pub struct Venue {
     commands: SyncSender<Command>,
     engine_thread: JoinHandle<RoundOutcome>,
     publisher_thread: JoinHandle<()>,
-    ring: Arc<Mutex<EventRing>>,
+    ring: Arc<SharedRing<Event>>,
 }
 
 /// How large the runtime's preallocated structures are.
@@ -157,7 +158,7 @@ impl Venue {
     {
         let engine = Engine::new(config)?;
         let (commands, inbox) = mpsc::sync_channel::<Command>(capacities.command_channel);
-        let ring = Arc::new(Mutex::new(EventRing::with_capacity(capacities.event_ring)));
+        let ring = Arc::new(SharedRing::with_capacity(capacities.event_ring));
 
         let engine_ring = Arc::clone(&ring);
         let engine_thread = thread::Builder::new()
@@ -186,7 +187,7 @@ impl Venue {
 
     /// The event ring, for a test standing in for the emissions S2 will produce.
     #[must_use]
-    pub fn ring(&self) -> Arc<Mutex<EventRing>> {
+    pub fn ring(&self) -> Arc<SharedRing<Event>> {
         Arc::clone(&self.ring)
     }
 
@@ -209,9 +210,7 @@ impl Venue {
         // The publisher is asked to stop only after the engine is done, so the engine is
         // never waiting on it. A publisher that died already is joined here as an Err and
         // deliberately ignored: the audit trail is best-effort (SPEC §13).
-        if let Ok(mut ring) = ring.lock() {
-            ring.push_shutdown();
-        }
+        ring.finish();
         let _ = publisher_thread.join();
         outcome
     }
@@ -222,7 +221,7 @@ fn run_engine<C: Clock>(
     mut engine: Engine,
     clock: &C,
     inbox: &mpsc::Receiver<Command>,
-    ring: &Arc<Mutex<EventRing>>,
+    ring: &SharedRing<Event>,
     capacities: RuntimeCapacities,
 ) -> RoundOutcome {
     let mut log: Vec<LogEntry> = Vec::with_capacity(capacities.command_log);
@@ -245,14 +244,12 @@ fn run_engine<C: Clock>(
                 sequence = sequence.saturating_add(1);
 
                 // Events move to the ring *outside* apply. The engine never touches the
-                // lock and never waits on the publisher.
-                if !events.is_empty()
-                    && let Ok(mut ring) = ring.lock()
-                {
-                    for event in events.drain() {
-                        ring.push(event);
-                        events_emitted = events_emitted.saturating_add(1);
-                    }
+                // lock and never waits on the publisher — and because the publisher checks
+                // an unshared atomic before locking, this acquisition is uncontended
+                // whenever the publisher is idle, which is most of the time.
+                if !events.is_empty() {
+                    events_emitted =
+                        events_emitted.saturating_add(ring.append(events.drain()));
                 }
 
                 coverage_checks = coverage_checks.saturating_add(1);
@@ -266,7 +263,7 @@ fn run_engine<C: Clock>(
         }
     }
 
-    let events_dropped = ring.lock().map_or(0, |ring| ring.dropped());
+    let events_dropped = ring.dropped();
     RoundOutcome {
         engine,
         log,
@@ -278,21 +275,26 @@ fn run_engine<C: Clock>(
 }
 
 /// Drains the ring and performs all I/O. Owns no engine state and writes none.
-fn run_publisher<S: EventSink>(mut sink: S, ring: &Arc<Mutex<EventRing>>) {
+fn run_publisher<S: EventSink>(mut sink: S, ring: &SharedRing<Event>) {
     loop {
-        let next = match ring.lock() {
-            Ok(mut ring) => {
-                if ring.shutdown_requested() && ring.is_empty() {
-                    return;
+        // The idle probe first, and it touches no lock. Locking in order to discover there
+        // is nothing to do is what made this loop contend with the engine on every command.
+        if ring.is_idle() {
+            if ring.is_finished() {
+                // `is_idle` is a relaxed read and may lag a final append, so the last look
+                // is taken under the lock. `finish` is called only after the engine thread
+                // has been joined, so nothing can arrive after this drain.
+                while let Some(event) = ring.pop() {
+                    sink.publish(event);
                 }
-                ring.pop()
+                return;
             }
-            // The ring's lock is poisoned, which means the engine panicked while holding it.
-            // The publisher has nothing left to publish.
-            Err(_) => return,
-        };
-        match next {
+            std::hint::spin_loop();
+            continue;
+        }
+        match ring.pop() {
             Some(event) => sink.publish(event),
+            // Lost the race to nobody: the ring emptied between the probe and the lock.
             None => std::hint::spin_loop(),
         }
     }

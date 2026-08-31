@@ -47,8 +47,6 @@ pub struct EventRing<T = Event> {
     next_sequence: u64,
     /// How many entries have been evicted unread over this ring's lifetime.
     dropped: u64,
-    /// Set once the engine has stopped, so the publisher can drain and retire.
-    shutdown: bool,
 }
 
 impl<T: Clone> EventRing<T> {
@@ -68,7 +66,6 @@ impl<T: Clone> EventRing<T> {
             len: 0,
             next_sequence: 0,
             dropped: 0,
-            shutdown: false,
         }
     }
 
@@ -118,20 +115,6 @@ impl<T: Clone> EventRing<T> {
         }
 
         sequence
-    }
-
-    /// Tell the publisher there will be no more events once the ring drains.
-    ///
-    /// Set after the engine thread has already finished, so the engine is never waiting on
-    /// the publisher — the dependency runs one way only (SPEC §13).
-    pub const fn push_shutdown(&mut self) {
-        self.shutdown = true;
-    }
-
-    /// Whether the engine has stopped.
-    #[must_use]
-    pub const fn shutdown_requested(&self) -> bool {
-        self.shutdown
     }
 
     /// Take the oldest waiting event.
