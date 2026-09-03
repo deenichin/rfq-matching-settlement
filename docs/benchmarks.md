@@ -4,6 +4,15 @@ Three implementations of the engine's event hand-off, and two of the command log
 rather than argued. Produced by `cargo bench -p rfq-runtime --bench latency` (percentiles)
 and `--bench hot_path` (criterion means).
 
+**Hardware: Apple M2 Pro — 6 performance cores and 4 efficiency cores.** That heterogeneity
+is the likely source of the bimodality visible throughout: a thread migrating to an
+efficiency core runs roughly 2–3× slower, which fits medians that flip between two stable
+values across runs. It is not fixable here — **macOS does not support thread affinity on
+Apple Silicon**. There is no `sched_setaffinity`, the Mach `THREAD_AFFINITY_POLICY` call is
+documented as unsupported on ARM Macs, and the only remaining lever is QoS class, which
+biases rather than pins and needs FFI that CLAUDE 25 forbids. So the variance is the machine,
+and the numbers should be read with that in mind.
+
 **Read the comparisons, not the absolutes.** These are laptop numbers on a machine with
 frequency scaling and other processes; the ratio between two rows on the same run is the
 thing the changes were made for.
@@ -45,9 +54,18 @@ Per run, so the consistency is visible:
 mutex with a spinning consumer is simply worse than a channel on every axis.
 
 **Design 2 and design 3 optimise different halves of the distribution.** The atomic probe has
-a median of ~10.4 ns, stable to a tenth of a nanosecond across runs and roughly 2.5× better
-than the channel. In the common case, when the consumer is not holding the lock, the
-producer's acquisition is uncontended and the extra atomic store is nearly free.
+a median of ~10.4 ns, stable to a tenth of a nanosecond across runs.
+
+**Why, tested rather than assumed.** The first hypothesis was that the channel pays to *wake*
+a parked consumer. A fourth design — the same channel with a consumer spinning on `try_recv`
+instead of parking — was added to check, and it is consistently **slower** than design 3, so
+the wake is not the cost.
+
+What explains it is the thing commit 1 was built on: design 2's consumer, when idle, spins on
+a cache-padded atomic that nothing else touches, so it generates no coherence traffic at all.
+Both channel designs touch the channel's internal head and tail atomics on every attempt,
+idle or not. **Design 2 has a contention-free idle state and neither channel has one** — and
+it pays for that by burning a core.
 
 But it has the **worst p99 and p99.9 of the three**, consistently. The mechanism is visible
 once looked for: the probe removes the consumer's contention and adds a producer-side store

@@ -182,6 +182,50 @@ fn bounded_channel() -> Summary {
     summarise(samples)
 }
 
+/// Design 4 — the same bounded channel, but the consumer **spins on `try_recv`** instead of
+/// parking on `recv`.
+///
+/// Added to test the hypothesis that design 3's slower median came from having to *wake* a
+/// parked consumer. **It does not.** Design 4 is consistently slower than design 3, so the
+/// wake is not the cost.
+///
+/// What is left is the explanation commit 1 was built on: design 2's consumer, when idle,
+/// spins on a cache-padded atomic that nothing else touches, generating no coherence traffic
+/// at all. Both channel designs touch the channel's internal head/tail atomics on every
+/// attempt, idle or not — design 4 hammers them hardest, which is why it is worst. Design 2
+/// has a contention-free idle state and neither channel has one.
+///
+/// Kept because a disproved hypothesis is worth more in the file than a guess, and because
+/// it is what attributes design 2's median to the right cause. Not a shipping candidate: a
+/// venue should not burn a core to publish events.
+fn bounded_channel_spinning_consumer() -> Summary {
+    let (tx, rx) = mpsc::sync_channel::<Payload>(256);
+    let stop = Arc::new(AtomicUsize::new(0));
+    let s = Arc::clone(&stop);
+    let consumer = thread::spawn(move || {
+        while s.load(Ordering::Relaxed) == 0 {
+            if rx.try_recv().is_err() {
+                std::hint::spin_loop();
+            }
+        }
+    });
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        for _ in 0..BATCH {
+            match tx.try_send(Payload([0; 36])) {
+                Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+            }
+        }
+        samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    stop.store(1, Ordering::Relaxed);
+    let _ = consumer.join();
+    drop(tx);
+    summarise(samples)
+}
+
 /// The command log, before — a `Vec` grown on the writer thread, so the tail contains every
 /// capacity doubling.
 fn log_growing_vec() -> Summary {
@@ -231,6 +275,7 @@ fn main() {
     row("  1 mutex, spinning consumer", &mutex_spinning());
     row("  2 mutex, atomic probe", &mutex_atomic_probe());
     row("  3 bounded channel  [shipping]", &bounded_channel());
+    row("  4 bounded channel, spinning rx", &bounded_channel_spinning_consumer());
 
     println!("\nCOMMAND LOG");
     row("  1 Vec grown on the writer", &log_growing_vec());
