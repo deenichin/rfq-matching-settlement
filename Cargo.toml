@@ -22,8 +22,12 @@ publish = false
 rfq-core = { path = "crates/core" }
 rfq-chain = { path = "crates/chain" }
 rfq-runtime = { path = "crates/runtime" }
-# The only dev-dependency permitted anywhere in the workspace (CLAUDE 36).
+# Dev-dependencies, permitted by name only (CLAUDE 36 — "anything else requires asking
+# first"). `criterion` was added deliberately: the design argues its latency properties
+# structurally and never measured them, which is how three costs outside `apply` — lock
+# contention, a per-command account scan, and a reallocating log — survived every test.
 proptest = "1"
+criterion = { version = "0.5", default-features = false }
 
 # Lints encode the CLAUDE.md rules that a compiler can check. The rules a compiler
 # cannot check are enforced by review and by the tests each stage gate names.

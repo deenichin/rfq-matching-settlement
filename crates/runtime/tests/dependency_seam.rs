@@ -95,10 +95,15 @@ fn custody_depends_on_shared_types_and_nothing_else() {
 
 #[test]
 fn the_runtime_wires_the_two_systems_and_owns_neither() {
+    // `criterion` is permitted **here and nowhere else**, and only as a dev-dependency: the
+    // benchmarks measure the hand-offs out of the engine thread, which live in this crate.
+    // `core` and `chain` keep their own lists, so this cannot leak into either.
     assert_dependencies_within(
         "runtime",
-        &["rfq-core", "rfq-chain", "proptest"],
-        "The runtime holds both systems side by side; it is the only crate permitted to.",
+        &["rfq-core", "rfq-chain", "proptest", "criterion"],
+        "The runtime holds both systems side by side; it is the only crate permitted to — \
+         and it is the only crate permitted a benchmark harness, because the hot path it \
+         measures is the one it owns.",
     );
 }
 

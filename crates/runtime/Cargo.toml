@@ -11,5 +11,12 @@ publish.workspace = true
 rfq-core = { workspace = true }
 rfq-chain = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
 [lints]
 workspace = true
