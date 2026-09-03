@@ -166,8 +166,18 @@ fn several_client_threads_submit_and_the_channel_serialises_them() {
     // 100 iterations. Flakiness here is a finding, not something to retry around.
     for iteration in 0..100 {
         let outcome = concurrent_round(TickClock::new(start, Dur(1)));
-        let RoundOutcome { engine, log, coverage_checks, events_dropped, events_emitted } =
-            outcome;
+        let RoundOutcome {
+            engine,
+            log,
+            coverage_checks,
+            events_dropped,
+            events_emitted,
+            halted,
+        } = outcome;
+        // The round ended because the clients finished, not because the log queue filled.
+        assert_eq!(halted, rfq_runtime::HaltReason::ChannelClosed, "iteration {iteration}");
+        // The publisher only receives, so a refusal would mean it stalled or died.
+        assert_eq!(events_dropped, 0, "iteration {iteration}: the publisher stopped draining");
 
         // ── (a) every submitted command appears exactly once, in channel order ──
         // One RegisterContract, then every client's commands.

@@ -1134,10 +1134,25 @@ event stream and performs all I/O.
 The engine performs **no I/O and no allocation** in `apply`. Events are written into a
 caller-provided buffer.
 
-**Backpressure is drop-oldest, never block.** The event queue is bounded and carries a
-sequence number so consumers detect gaps. Blocking the sole writer on a full queue would let
-one slow consumer stall the entire venue — a denial vector strictly worse than the lost
-events it prevents. The engine must never be stallable by a consumer.
+**Backpressure never blocks, and the two streams differ on what a full queue means.** Both
+leave the engine thread on bounded, preallocated channels to workers that own the
+consequences. Blocking the sole writer would let one slow consumer stall the entire venue — a
+denial vector strictly worse than the loss it prevents — so the engine must never be
+stallable by a consumer, and `try_send` makes that structural rather than a policy.
+
+*Events* are refused when the queue is full: the newest is dropped, counted, and the sequence
+number each event carries exposes the gap. Refusing the newest rather than evicting the
+oldest is what keeps the producer from writing the consumer's cursor. The cost is that a
+persistently slow consumer's staleness is unbounded, where evicting the oldest would have
+bounded it at capacity — and the mitigation is that the engine's only counterparty is a
+worker that does nothing but receive, so a refusal means that worker has stopped rather than
+that a subscriber is slow.
+
+*The command log* has no such freedom. `replay` reconstructs engine state from it and §12
+names it as the recovery path for a reorg deeper than the confirmation depth, so a dropped
+entry is a lost guarantee rather than a lost message. Dropping is therefore unavailable and
+blocking is forbidden, which leaves halting: the engine stops applying commands it cannot
+record, and says why. Durability over availability, stated rather than discovered.
 
 **If the publisher dies, the engine keeps applying.** The audit trail is best-effort; the
 state machine is authoritative. Stopping the sole writer would leave commands unapplied and

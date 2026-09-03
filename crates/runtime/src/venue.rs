@@ -30,18 +30,16 @@
 //! and the command log incomplete, which is strictly worse than losing event continuity.
 
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use rfq_core::clock::Clock;
 use rfq_core::command::Command;
 use rfq_core::config::Config;
 use rfq_core::engine::{Engine, EngineError};
-use rfq_core::event::{Event, EventBuffer};
+use rfq_core::event::EventBuffer;
 use rfq_core::types::Ts;
 
-use crate::event_ring::SequencedEvent;
-use crate::shared_ring::SharedRing;
+use crate::handoff::{HaltReason, SequencedEvent, Sequenced};
 
 /// One entry of the append-only command log.
 ///
@@ -93,21 +91,25 @@ pub struct RoundOutcome {
     /// claim coverage ran. Asserting the count is what keeps "coverage held throughout" from
     /// being satisfied by never checking (CLAUDE 39).
     pub coverage_checks: u64,
-    /// Events evicted from the ring unread.
+    /// Events the publisher could not be handed — refused at the channel boundary because
+    /// it had stopped draining. **Must be zero on a healthy round**: the worker only
+    /// receives, so a refusal means it was descheduled or has died, never that a subscriber
+    /// is slow.
     pub events_dropped: u64,
     /// Events the engine emitted. Counted so a test can assert the engine *did* emit —
     /// an event path that carries nothing proves nothing about the publisher.
     pub events_emitted: u64,
+    /// Why the engine stopped. `ChannelClosed` is the ordinary end of a round.
+    pub halted: HaltReason,
 }
 
-/// A running venue: one engine thread, one publisher thread, one bounded command channel.
+/// A running venue: one engine thread, two worker threads, three bounded channels.
 #[derive(Debug)]
 pub struct Venue {
     commands: SyncSender<Command>,
     engine_thread: JoinHandle<EngineRound>,
     publisher_thread: JoinHandle<()>,
     logger_thread: JoinHandle<Vec<LogEntry>>,
-    ring: Arc<SharedRing<Event>>,
 }
 
 /// What the engine thread returns. The command log is not part of it: the engine hands
@@ -118,6 +120,7 @@ struct EngineRound {
     coverage_checks: u64,
     events_dropped: u64,
     events_emitted: u64,
+    halted: HaltReason,
 }
 
 /// How large the runtime's preallocated structures are.
@@ -168,61 +171,39 @@ impl Venue {
     {
         let engine = Engine::new(config)?;
         let (commands, inbox) = mpsc::sync_channel::<Command>(capacities.command_channel);
-        let ring = Arc::new(SharedRing::with_capacity(capacities.event_ring));
 
-        // Unbounded, and deliberately: a bounded log channel would either stall the engine
-        // when full — the one thing SPEC §13 forbids — or drop entries, which breaks the
-        // replay the log exists for. Unbounded moves the growth to a thread that is not
-        // latency-critical, and costs the engine one small constant-size send per command
-        // instead of an occasional quarter-megabyte reallocation.
-        //
-        // **This is a small improvement, and it is worth being exact about how small.** It
-        // changes the shape of the allocation rather than removing it. An unbounded channel
-        // has to allocate to hold an arbitrary number of entries, so a send is a slot write
-        // plus a block allocation every few dozen commands. What it buys is that the worst
-        // single command is now one small block instead of a reallocate-and-copy of the
-        // whole log — bounded rather than proportional to how long the venue has been up —
-        // and that the unbounded growth belongs to a thread with nothing to be late for.
-        // The mean cost went slightly *up*: an atomic and an amortised malloc where there
-        // used to be a bare memcpy into a preallocated slot. That trade is right for a
-        // writer whose tail matters, and it is not the same claim as allocation-free.
-        //
-        // See `run_logger` for what allocation-free would actually take.
-        let (entries, journal) = mpsc::channel::<LogEntry>();
+        // Two bounded, preallocated hand-offs. Both `try_send` from the engine thread: no
+        // lock it can see, no allocation, and no way to block — the type offers no such
+        // method on this path. See `handoff` for why the two differ on a full queue.
+        let (events_out, events_in) = mpsc::sync_channel::<SequencedEvent>(capacities.event_ring);
+        let (entries, journal) = mpsc::sync_channel::<LogEntry>(capacities.command_log);
+
+        let publisher_thread = thread::Builder::new()
+            .name("publisher".to_owned())
+            .spawn(move || run_publisher(sink, &events_in))
+            .unwrap_or_else(|error| panic!("the publisher thread must start: {error}"));
+
         let logger_thread = thread::Builder::new()
             .name("logger".to_owned())
             .spawn(move || run_logger(&journal, capacities.command_log))
             .unwrap_or_else(|error| panic!("the logger thread must start: {error}"));
 
-        let engine_ring = Arc::clone(&ring);
         let engine_thread = thread::Builder::new()
             .name("engine".to_owned())
             .spawn(move || {
                 // The clock is owned by this closure and therefore by the engine thread.
                 // Nothing else can read it, so there is one clock and one sample per command.
-                run_engine(engine, &clock, &inbox, &engine_ring, &entries, capacities)
+                run_engine(engine, &clock, &inbox, &events_out, &entries, capacities)
             })
             .unwrap_or_else(|error| panic!("the engine thread must start: {error}"));
 
-        let publisher_ring = Arc::clone(&ring);
-        let publisher_thread = thread::Builder::new()
-            .name("publisher".to_owned())
-            .spawn(move || run_publisher(sink, &publisher_ring))
-            .unwrap_or_else(|error| panic!("the publisher thread must start: {error}"));
-
-        Ok(Self { commands, engine_thread, publisher_thread, logger_thread, ring })
+        Ok(Self { commands, engine_thread, publisher_thread, logger_thread })
     }
 
     /// A handle for a client thread to submit on. Cloneable: many producers, one consumer.
     #[must_use]
     pub fn commands(&self) -> SyncSender<Command> {
         self.commands.clone()
-    }
-
-    /// The event ring, for a test standing in for the emissions S2 will produce.
-    #[must_use]
-    pub fn ring(&self) -> Arc<SharedRing<Event>> {
-        Arc::clone(&self.ring)
     }
 
     /// Close the channel, wait for the engine to drain it, and take the round's results.
@@ -236,18 +217,16 @@ impl Venue {
     /// nothing sensible to return.
     #[must_use]
     pub fn join(self) -> RoundOutcome {
-        let Self { commands, engine_thread, publisher_thread, logger_thread, ring } = self;
+        let Self { commands, engine_thread, publisher_thread, logger_thread } = self;
         drop(commands);
         let round = engine_thread
             .join()
             .unwrap_or_else(|_| panic!("the engine thread must not panic; it owns the state"));
-        // The engine dropped its sender when it returned, so the logger's channel is closed
-        // and it has already retired with the complete log.
+        // The engine dropped both senders when it returned, so each worker's channel is
+        // closed and it retires on its own. No shutdown flag and no handshake: closing the
+        // sender *is* the signal, which is one fewer thing to get wrong than a flag that
+        // lived inside a lock.
         let log = logger_thread.join().unwrap_or_default();
-        // The publisher is asked to stop only after the engine is done, so the engine is
-        // never waiting on it. A publisher that died already is joined here as an Err and
-        // deliberately ignored: the audit trail is best-effort (SPEC §13).
-        ring.finish();
         let _ = publisher_thread.join();
         RoundOutcome {
             engine: round.engine,
@@ -255,6 +234,7 @@ impl Venue {
             coverage_checks: round.coverage_checks,
             events_dropped: round.events_dropped,
             events_emitted: round.events_emitted,
+            halted: round.halted,
         }
     }
 }
@@ -264,16 +244,17 @@ fn run_engine<C: Clock>(
     mut engine: Engine,
     clock: &C,
     inbox: &mpsc::Receiver<Command>,
-    ring: &SharedRing<Event>,
-    entries: &mpsc::Sender<LogEntry>,
+    events_out: &SyncSender<SequencedEvent>,
+    entries: &SyncSender<LogEntry>,
     capacities: RuntimeCapacities,
 ) -> EngineRound {
     let mut events = EventBuffer::with_capacity(capacities.event_buffer);
     let mut sequence: u64 = 0;
+    let mut event_sequence: u64 = 0;
     let mut coverage_checks: u64 = 0;
     let mut events_emitted: u64 = 0;
-
-    loop {
+    let mut events_dropped: u64 = 0;
+    let halted = loop {
         match inbox.try_recv() {
             Ok(command) => {
                 // Sampled once, here, at the call site (CLAUDE 2). Nothing downstream can
@@ -282,23 +263,28 @@ fn run_engine<C: Clock>(
                 events.clear();
                 let outcome = engine.apply(command, now, &mut events);
 
-                // Handed off, not accumulated. A `Vec` that grows on this thread turns one
-                // push in every capacity-doubling into a reallocate-and-copy of the whole
-                // log — amortised O(1), and a tail-latency spike exactly where the design
-                // cares about the tail. The send is constant-size and the growth belongs to
-                // a thread with nothing to be late for. A logger that has gone away is
-                // ignored: the audit trail is best-effort and the state machine is
-                // authoritative (SPEC §13).
-                let _ = entries.send(LogEntry { sequence, at: now, command, outcome });
+                // Handed off, not accumulated, and **the log's full queue halts the
+                // engine**. Dropping an entry would leave commands applied that `replay`
+                // can never reproduce — SPEC §12's recovery path — so there is nothing safe
+                // to do but stop. Blocking is the one thing SPEC §13 rules out, so this is
+                // the remaining choice and it is durability over availability.
+                if entries.try_send(LogEntry { sequence, at: now, command, outcome }).is_err() {
+                    break HaltReason::LogUnrecordable;
+                }
                 sequence = sequence.saturating_add(1);
 
-                // Events move to the ring *outside* apply. The engine never touches the
-                // lock and never waits on the publisher — and because the publisher checks
-                // an unshared atomic before locking, this acquisition is uncontended
-                // whenever the publisher is idle, which is most of the time.
-                if !events.is_empty() {
-                    events_emitted =
-                        events_emitted.saturating_add(ring.append(events.drain()));
+                // Events leave by a bounded channel the engine cannot block on. A refusal
+                // means the publisher stopped draining, never that a subscriber is slow —
+                // the worker only receives. Counted, because a silent drop is the failure
+                // this design is most careful about elsewhere (SPEC §11.2).
+                for event in events.drain() {
+                    let sequenced = Sequenced { sequence: event_sequence, event };
+                    event_sequence = event_sequence.saturating_add(1);
+                    if events_out.try_send(sequenced).is_ok() {
+                        events_emitted = events_emitted.saturating_add(1);
+                    } else {
+                        events_dropped = events_dropped.saturating_add(1);
+                    }
                 }
 
                 // Claim coverage is an invariant, and an invariant check is not production
@@ -334,12 +320,21 @@ fn run_engine<C: Clock>(
             }
             // Busy-spin. The venue has one writer and no reason to park it.
             Err(TryRecvError::Empty) => std::hint::spin_loop(),
-            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Disconnected) => break HaltReason::ChannelClosed,
         }
-    }
+    };
 
-    let events_dropped = ring.dropped();
-    EngineRound { engine, coverage_checks, events_dropped, events_emitted }
+    EngineRound { engine, coverage_checks, events_dropped, events_emitted, halted }
+}
+
+/// Drains events and performs all I/O. Owns no engine state and writes none.
+///
+/// Blocks on `recv`, so it costs nothing while idle — no spin, no lock, no contention with
+/// the engine for a cache line. Ends when the engine drops its sender.
+fn run_publisher<S: EventSink>(mut sink: S, journal: &mpsc::Receiver<SequencedEvent>) {
+    while let Ok(event) = journal.recv() {
+        sink.publish(event);
+    }
 }
 
 /// Owns the command log. Receives entries and never touches engine state.
@@ -382,32 +377,6 @@ fn run_logger(journal: &mpsc::Receiver<LogEntry>, capacity: usize) -> Vec<LogEnt
         log.push(entry);
     }
     log
-}
-
-/// Drains the ring and performs all I/O. Owns no engine state and writes none.
-fn run_publisher<S: EventSink>(mut sink: S, ring: &SharedRing<Event>) {
-    loop {
-        // The idle probe first, and it touches no lock. Locking in order to discover there
-        // is nothing to do is what made this loop contend with the engine on every command.
-        if ring.is_idle() {
-            if ring.is_finished() {
-                // `is_idle` is a relaxed read and may lag a final append, so the last look
-                // is taken under the lock. `finish` is called only after the engine thread
-                // has been joined, so nothing can arrive after this drain.
-                while let Some(event) = ring.pop() {
-                    sink.publish(event);
-                }
-                return;
-            }
-            std::hint::spin_loop();
-            continue;
-        }
-        match ring.pop() {
-            Some(event) => sink.publish(event),
-            // Lost the race to nobody: the ring emptied between the probe and the lock.
-            None => std::hint::spin_loop(),
-        }
-    }
 }
 
 /// Replay a command log through a fresh engine, single-threaded.
