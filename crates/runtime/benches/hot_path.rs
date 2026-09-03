@@ -26,14 +26,18 @@
 //! | 2 — mutex, cache-padded atomic probe | 70.6 ns | 41.5 ns | 70.5 ns | **bimodal** |
 //! | 3 — bounded channel *(shipping)* | 41.0 ns | 42.0 ns | 42.3 ns | **stable** |
 //!
-//! **Design 2 is not demonstrably an improvement**, and the first single run suggested it
-//! was — which is the argument for repeating a contended benchmark rather than quoting one.
-//! It is bimodal, and on two runs of three it was *slower* than the mutex it replaced.
+//! Design 2 looks unstable here — bimodal, and slower than design 1 on two runs of three.
+//! **That reading is a mean applied to a skewed distribution, and `benches/latency.rs`
+//! corrects it**: design 2 has a *median* of 10.4 ns, five times better than either other
+//! design and stable to a tenth of a nanosecond, with a long tail that drags the mean around.
 //!
-//! There is a mechanism for that. The probe removes the consumer's contention but adds a
-//! producer-side store to the padded length on every push, so the producer now invalidates
-//! **two** cache lines where it used to invalidate one. Whether that trade pays depends on
-//! how the two threads are scheduled, which is exactly what varies between runs.
+//! What is true is that the probe removes the consumer's contention and adds a producer-side
+//! store to the padded length on every push, so the producer invalidates **two** cache lines
+//! where it used to invalidate one — which shows up as the worst p99 of the three. It
+//! improves the common case and worsens the tail.
+//!
+//! See `docs/benchmarks.md`. This file reports means; percentiles are the useful summary for
+//! a single writer, and they live next door.
 //!
 //! Design 3 is both fastest and — more usefully — the only one whose cost is predictable.
 //!
@@ -65,11 +69,16 @@
 //! | one `Vec` push that triggers a realloc of 65,536 entries | **194 µs** |
 //! | one channel send | **31 ns** |
 //!
-//! ~6,000× on the worst single operation, and the spike **grows with the log** while the
-//! send does not. So the trade is ~13 ns of mean per command against a 194 µs stall that
-//! gets worse the longer the venue runs. For a writer whose tail is the point, that is
-//! clearly right — but "allocation-free" was never the claim to make, and the throughput
-//! column is why.
+//! That 194 µs is a *forced* boundary push on a fresh 65,536-entry `Vec`. Measured against a
+//! log growing organically, `benches/latency.rs` sees a worst batch of about 6 µs — large
+//! reallocations on this platform appear to be served by virtual-memory remapping rather
+//! than a physical copy, so the spike is much cheaper than the byte count suggests, and
+//! platform-dependent.
+//!
+//! So the latency case for moving the log is **weaker than this group implies**. The
+//! justification that survives measurement is that a `Vec` on the writer grows without bound
+//! in the writer's own address space, and that growth belongs on a thread that can page,
+//! rotate or persist it. See `docs/benchmarks.md`.
 //!
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::arithmetic_side_effects)]
 // Benchmark payloads are sized to match the real types and never read; `criterion_group!`

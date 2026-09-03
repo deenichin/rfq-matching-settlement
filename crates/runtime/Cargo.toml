@@ -18,5 +18,9 @@ criterion = { workspace = true }
 name = "hot_path"
 harness = false
 
+[[bench]]
+name = "latency"
+harness = false
+
 [lints]
 workspace = true
